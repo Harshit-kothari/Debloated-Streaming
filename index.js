@@ -11,6 +11,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import terminalImage from 'terminal-image';
+import http from 'http';
+import https from 'https';
 
 const h = React.createElement;
 
@@ -80,11 +82,33 @@ const PLAYERS = [
   },
 ];
 
+function fetchBuffer(url) {
+  return new Promise((resolve) => {
+    try {
+      const client = url.startsWith('https') ? https : http;
+      const req = client.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          return resolve(fetchBuffer(res.headers.location));
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return resolve(null);
+        }
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+      req.on('error', () => resolve(null));
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 async function fetchJson(url) {
+  const buf = await fetchBuffer(url);
+  if (!buf) return [];
   try {
-    const res = await fetch(url);
-    if (!res.ok) return [];
-    const data = await res.json();
+    const data = JSON.parse(buf.toString('utf-8'));
     return Array.isArray(data.matches) ? data.matches : [];
   } catch {
     return [];
@@ -133,11 +157,15 @@ async function loadMatches() {
 
   for (const m of sonyliv) {
     const streamUrl = m.video_url || m.dai_url || null;
+    let title = m.match_name || m.event_name || 'SonyLiv Event';
+    if (m.event_name && m.match_name && !m.match_name.toLowerCase().includes(m.event_name.toLowerCase())) {
+      title = `${m.event_name} · ${m.match_name}`;
+    }
     matches.push({
       id: `sonyliv:${m.contentId}`,
       provider: 'SonyLiv',
       isLive: m.isLive === true,
-      title: m.match_name || m.event_name || 'SonyLiv Event',
+      title,
       team1: null,
       team2: null,
       competition: m.event_name || m.event_category || 'Unknown',
@@ -160,14 +188,16 @@ async function loadMatches() {
 
 function playStream(url, playerBin, playerArgs, userAgent, onExit) {
   const args = [...playerArgs];
+  const itemOptions = [];
   if (userAgent) {
     if (playerBin.includes('mpv')) {
       args.push(`--user-agent=${userAgent}`);
     } else if (playerBin.toLowerCase().includes('vlc')) {
       args.push(`--http-user-agent=${userAgent}`);
+      itemOptions.push(`:http-user-agent=${userAgent}`);
     }
   }
-  const player = spawn(playerBin, [...args, url], { stdio: 'inherit' });
+  const player = spawn(playerBin, [...args, url, ...itemOptions], { stdio: 'inherit' });
   player.on('error', (err) => {
     console.error(`Could not launch "${playerBin}": ${err.message}`);
     onExit(1);
@@ -182,9 +212,8 @@ async function renderPoster(url, widthCols, heightRows) {
   const cacheKey = `${url}:${widthCols}x${heightRows}`;
   if (imageCache.has(cacheKey)) return imageCache.get(cacheKey);
   try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const buffer = Buffer.from(await res.arrayBuffer());
+    const buffer = await fetchBuffer(url);
+    if (!buffer) return null;
     // Giving BOTH width and height (in terminal columns/rows) with
     // preserveAspectRatio makes it "contain" within that box instead of
     // overflowing - passing only width let the auto-computed height blow
