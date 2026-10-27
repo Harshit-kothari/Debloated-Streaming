@@ -92,7 +92,7 @@ npm test
 The tests cover login state and response validation, catalogue discovery and pagination, partial feed failures, player launch/cancellation, HLS rewriting, and the Node-to-Python bridge. They do not send OTPs or require real account playback.
 
 ## Additional acknowledgments
-
+- [jiohotstar-downloader](https://github.com/arvind88765/jiohotstar-downloader) - referenced for Hotstar workflow.
 - [fancode-live-events](https://github.com/drmlive/fancode-live-events) and [sliv-live-events](https://github.com/drmlive/sliv-live-events) supply community event feeds.
 
 Debloated Streaming adds the unified launcher, persistent OTP handling, direct Hotstar discovery, player discovery, corrected relay handling, and terminal status presentation on top of the credited foundations.
