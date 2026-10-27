@@ -9,6 +9,18 @@ A lean terminal app for browsing live sports, discovering JioHotstar live events
 
 Their work made this project possible. See [CREDITS.md](CREDITS.md) for component attribution. The terminal browser's original MIT notice is preserved in [LICENSE.tui](LICENSE.tui).
 
+## Upstream contributors
+
+Debloated Streaming builds on contributions from these original project contributors:
+
+| Contributor | Foundation |
+| --- | --- |
+| [sonstellar969](https://github.com/sonstellar969) | Creator and contributor of [livesports-tui](https://github.com/sonstellar969/livesports-tui) |
+| [praveenmutyala2006](https://github.com/praveenmutyala2006) | Contributor to [livesports-tui](https://github.com/sonstellar969/livesports-tui/graphs/contributors) |
+| [arvind88765](https://github.com/arvind88765) | Creator of [jio-hotstar-stream-proxy](https://github.com/arvind88765/jio-hotstar-stream-proxy) |
+
+The original commit histories of both foundation projects are preserved alongside Debloated Streaming's changes.
+
 ## What it does
 
 - Lists live and upcoming Fancode and SonyLiv events alongside live entries discovered directly from your Hotstar catalogue.

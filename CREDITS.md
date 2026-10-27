@@ -6,9 +6,11 @@ Debloated Streaming is built on top of the following projects. Credit for the or
 
 - Project: https://github.com/sonstellar969/livesports-tui
 - Creator: [sonstellar969](https://github.com/sonstellar969)
+- Upstream contributors: [sonstellar969](https://github.com/sonstellar969) and [praveenmutyala2006](https://github.com/praveenmutyala2006), as listed in the [original contributor history](https://github.com/sonstellar969/livesports-tui/graphs/contributors).
 - Contribution: the original React/Ink terminal sports browser, Fancode/SonyLiv event workflow, poster previews, and MPV/VLC player selection.
 - Original copyright notice: Copyright (c) 2026 Lakshman Reddy.
 - The original MIT notice is retained in [LICENSE.tui](LICENSE.tui).
+- Original commits and authorship are preserved as part of this project's foundation history.
 
 ## jio-hotstar-stream-proxy
 
