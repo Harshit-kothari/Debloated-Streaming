@@ -1,0 +1,32 @@
+{
+  "name": "debloated-streaming",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Debloated Streaming: a terminal browser for live sports, JioHotstar login, and MPV/VLC playback",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "doctor": "node index.js --doctor",
+    "login": "node index.js --login",
+    "web": "python hotstar_live.py",
+    "setup": "python -m pip install -r Requirements.txt",
+    "test": "node --test tests/*.test.js && python -m unittest discover -s tests -p test_*.py"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "react": "^19.2.8",
+    "terminal-image": "^5.0.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Harshit-kothari/Debloated-Streaming.git"
+  },
+  "homepage": "https://github.com/Harshit-kothari/Debloated-Streaming#readme",
+  "bugs": {
+    "url": "https://github.com/Harshit-kothari/Debloated-Streaming/issues"
+  }
+}

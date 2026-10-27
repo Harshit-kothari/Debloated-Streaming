@@ -1,46 +1,30 @@
 #!/usr/bin/env python3
 """
-Hotstar Live Relay  v3
+Debloated Streaming — Hotstar Relay
 -----------------------
 Generates shareable links for Hotstar live streams.
 Family/friends open the link in any browser — stream plays via hls.js.
-Your machine only proxies the tiny master playlist; all segment bytes
-come straight from Hotstar CDN to their device.
+The local service relays playlists and media requests for your player.
 
 pip install flask requests pyngrok
 python hotstar_live.py
 open http://localhost:8080
 
-ngrok tunnel auto-starts if pyngrok is installed.
+A public tunnel starts only when explicitly enabled.
 Set NGROK_AUTHTOKEN env var or paste token in Settings on the page.
 
-Made by Rvind
+Original relay by Rvind (arvind88765); extended for Debloated Streaming.
 """
 
-import sys, os, re, json, time, hmac, hashlib, threading, uuid
-import subprocess
-from urllib.parse import urlparse, urljoin, quote, unquote, parse_qs
+import os, re, json, time, hmac, hashlib, threading, uuid
+from urllib.parse import urlparse, urljoin
 
-# ---------------------------------------------------------------------------
-# DEPENDENCY BOOTSTRAP
-# ---------------------------------------------------------------------------
-
-def _pip(*pkgs):
-    subprocess.run([sys.executable, "-m", "pip", "install", *pkgs, "-q",
-                    "--break-system-packages"], check=False)
-
+# Dependencies are installed explicitly; importing the backend never runs pip.
 try:
     from flask import Flask, request, Response, jsonify
-except ImportError:
-    _pip("flask")
-    from flask import Flask, request, Response, jsonify
-
-# Plain requests for BFF (hotstar.com) — no TLS fingerprint check there
-try:
     import requests as req
-except ImportError:
-    _pip("requests")
-    import requests as req
+except ImportError as exc:
+    raise ImportError("Missing Python dependencies. Run: python -m pip install -r Requirements.txt") from exc
 
 # curl_cffi for CDN (live09p.hotstar.com = Akamai with TLS fingerprint check)
 _cdn_session = None
@@ -107,7 +91,7 @@ _DRM_PARAMS = json.dumps({
 }, separators=(",", ":"))
 
 APP_DIR    = os.path.dirname(os.path.abspath(__file__))
-PORT       = 8080
+PORT       = int(os.environ.get("HOTSTAR_PORT", "8080"))
 _CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 
 # ---------------------------------------------------------------------------
@@ -180,44 +164,16 @@ def stop_ngrok():
 # AUTH
 # ---------------------------------------------------------------------------
 
-def load_token():
-    """Read login token from hotstar_token.json (same file GUI saves)."""
-    candidates = [
-        os.path.join(APP_DIR, "hotstar_token.json"),
-        os.path.join(APP_DIR, "hs_token.json"),
-    ]
-    for p in candidates:
-        if not os.path.exists(p):
-            continue
-        try:
-            d   = json.load(open(p))
-            tok = d.get("user_token") or d.get("token") or ""
-            if tok and len(tok) > 200:
-                print(f"[auth] token loaded from {os.path.basename(p)}")
-                return tok
-        except Exception:
-            pass
-    print("[auth] WARNING: no token file found — some streams need login")
-    return None
-
-import base64 as _b64
-
-def jwt_exp(tok):
-    try:
-        p = tok.split('.')[1]; p += '='*(4-len(p)%4)
-        return json.loads(_b64.b64decode(p))['exp']
-    except: return 0
-
-def tok_valid(tok): return bool(tok) and jwt_exp(tok) > time.time()+60
-
-def tok_remaining(tok):
-    h = (jwt_exp(tok) - time.time()) / 3600
-    return f"{h:.1f}h remaining" if h > 0 else "expired"
-
-def save_token_file(tok, phone=""):
-    path = os.path.join(APP_DIR, "hotstar_token.json")
-    json.dump({"user_token": tok, "phone": phone, "saved_at": int(time.time()), "expires_at": jwt_exp(tok)}, open(path, 'w'), indent=2)
-    return path
+import hotstar_auth as auth
+load_token = auth.load_token
+jwt_exp = auth.jwt_exp
+tok_valid = auth.tok_valid
+tok_remaining = auth.tok_remaining
+save_token_file = auth.save_token_file
+get_device_id_from_token = auth.get_device_id_from_token
+api_guest_token = auth.api_guest_token
+api_send_otp = auth.api_send_otp
+api_verify_otp = auth.api_verify_otp
 
 _FP_SAMPLE = (
     'MDA3MGYyZTAtZGYxMS00ODhjLThlNmItYjczYmEwNjNhYjIz.BPicufgJ44ZZHXqTv8pNoJXgX2WYShUBEW8vws'
@@ -228,32 +184,10 @@ _FP_SAMPLE = (
     'MiFBcgxkaVgRAFhCiuTVqx4LPQ3oicviTI5LdocPAfGHunCSPwi-nnML_hEAXRlw3GXGZcsmujLeMgrJVwyn05y'
 )
 
-def _android_hdrs(token=None):
-    h = {
-        "User-Agent":          "Hotstar;in.startv.hotstar/26.09.05.0.11013 (Android/14)",
-        "Content-Type":        "application/x-protobuf",
-        "X-Country-Code":      "in", "X-HS-App": "11013",
-        "X-HS-APP-ID":         "c86aad81-d602-46e5-b6a0-6d3891199063",
-        "X-HS-Client":         "platform:android;app_id:in.startv.hotstar;app_version:26.09.05.0;os:Android;os_version:14;schema_version:0.0.1797;brand:Samsung;model:SM-S918B;carrier:airtel;network_data:NETWORK_TYPE_WIFI",
-        "X-HS-Device-Id":      _DEVICE_ID, "X-HS-Platform": "android",
-        "X-HS-Schema-Version": "0.0.1797",
-        "X-HS-FP-Info":        _FP_SAMPLE,
-        "hotstarauth":         _make_hotstar_auth(),
-    }
-    if token: h["X-HS-Usertoken"] = token
-    return h
-
 def _make_hotstar_auth():
     st = int(time.time()); exp = st + 6000
     msg = f"st={st}~exp={exp}~acl=/*"
     return f"{msg}~hmac={hmac.new(_HMAC_KEY, msg.encode(), hashlib.sha256).hexdigest()}"
-
-_login_state = {}  # phone -> {guest_tok, ps, method}
-
-def _find_jwt(data):
-    src = data if isinstance(data, str) else (data.decode('utf-8','replace') if isinstance(data, bytes) else str(data))
-    hits = [h for h in re.findall(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', src) if len(h) > 200]
-    return max(hits, key=len) if hits else None
 
 def _dl_android_hdrs(token=None):
     """Android headers for login flow (matches jiohotstar-downloader exactly)."""
@@ -286,99 +220,6 @@ def _dl_web_hdrs(token=None, ps=None):
     if token: h["x-hs-usertoken"] = token
     if ps:    h["x-hs-proxystate"] = ps
     return h
-
-def api_guest_token():
-    """Get guest token — tries apix (Android) first, falls back to web BFF."""
-    try:
-        r = req.post("https://apix.hotstar.com/v2/freshstart",
-            params={"client_capabilities": json.dumps({"package":["dash","hls"],"container":["fmp4","ts"],
-                "encryption":["plain","widevine"],"video_codec":["h264"],"ladder":["phone"],
-                "resolution":["sd","hd","fhd"],"dynamic_range":["sdr"]}),
-                "drm_parameters": json.dumps({"widevine_security_level":["HW_SECURE_ALL","SW_SECURE_DECODE"],
-                "hdcp_version":["HDCP_V2_2"]}), "subs":"null", "login":"UNKNOWN"},
-            headers=_dl_android_hdrs(), data=b'', timeout=15)
-        g = r.headers.get("x-hs-updatedusertoken") or _find_jwt(r.content)
-        if g: return g, None, "android"
-    except: pass
-    try:
-        r = req.post("https://www.hotstar.com/api/internal/bff/v2/start",
-            params={"journey":"login"}, headers=_dl_web_hdrs(),
-            json={"deeplink_url":"","context":{"url":"type.googleapis.com/context.StateContext","value":"CgQaAggC"},"app_launch_count":1},
-            timeout=15)
-        g = r.headers.get("x-hs-updatedusertoken")
-        ps = r.headers.get("x-hs-setproxystate")
-        if g: return g, ps, "web"
-    except: pass
-    return None, None, None
-
-def api_send_otp(phone, guest, ps=None, method="web"):
-    """Send OTP via web BFF widget endpoint, falling back to Android protobuf API."""
-    try:
-        r = req.post(
-            "https://www.hotstar.com/api/internal/bff/v2/pages/1/spaces/1/widgets/8",
-            params={"action":"sendOtp","pageRef":"myspace","page_enum":"onboarding_login","qrCode":"true"},
-            headers=_dl_web_hdrs(token=guest, ps=ps),
-            json={"body":{"@type":"type.googleapis.com/feature.login.InitiatePhoneLoginRequest",
-                          "initiate_by":0,"recaptcha_token":"","phone_number":phone}},
-            timeout=15)
-        if r.status_code in (200,201,202):
-            d = {}
-            try: d = r.json()
-            except: pass
-            if "error" not in d: return True, "web"
-    except: pass
-    try:
-        pb = phone.encode()
-        inner = b'\x0a'+bytes([len(pb)])+pb
-        outer = b'\x0a'+bytes([len(inner)])+inner
-        r = req.post("https://apix.hotstar.com/v2/pages/1/spaces/1/widgets/8",
-            params={"action":"sendOtp"}, headers=_dl_android_hdrs(guest), data=outer, timeout=15)
-        if r.status_code == 200: return True, "android"
-    except: pass
-    return False, None
-
-def api_verify_otp(phone, otp, guest, ps=None, method="web"):
-    """Verify OTP and return user JWT — token comes in x-hs-updatedusertoken header."""
-    if method == "web":
-        try:
-            r = req.post(
-                "https://www.hotstar.com/api/internal/bff/v2/pages/1/spaces/1/widgets/9",
-                params={"action":"verifyOtp","pageRef":"myspace","page_enum":"onboarding_login","qrCode":"true"},
-                headers=_dl_web_hdrs(token=guest, ps=ps),
-                json={"body":{"@type":"type.googleapis.com/feature.login.VerifyPhoneLoginRequest",
-                              "verification_code":otp,
-                              "login_device_meta":{"device_name":"Chrome Browser on Windows"},
-                              "phone_number":phone}},
-                timeout=15)
-            tok = r.headers.get("x-hs-updatedusertoken") or _find_jwt(r.text)
-            if tok and len(tok) > 200: return tok
-        except: pass
-    try:
-        pb, ob = phone.encode(), otp.encode()
-        inner = b'\x0a'+bytes([len(pb)])+pb+b'\x12'+bytes([len(ob)])+ob
-        outer = b'\x0a'+bytes([len(inner)])+inner
-        r = req.post("https://apix.hotstar.com/v2/pages/1/spaces/1/widgets/9",
-            params={"action":"verifyOtp"}, headers=_dl_android_hdrs(guest), data=outer, timeout=15)
-        tok = r.headers.get("x-hs-updatedusertoken") or _find_jwt(r.content)
-        if tok and len(tok) > 200: return tok
-    except: pass
-    return None
-
-def get_device_id_from_token(token):
-    """Extract deviceId embedded in JWT sub claim."""
-    try:
-        import base64
-        payload = token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        d   = json.loads(base64.b64decode(payload))
-        sub = json.loads(d["sub"])
-        did = sub.get("deviceId", "")
-        if did:
-            print(f"[auth] device_id from JWT: {did}")
-            return did
-    except Exception as e:
-        print(f"[auth] device_id parse error: {e}")
-    return str(uuid.uuid4())[:23]
 
 # ---------------------------------------------------------------------------
 # PROXYSTATE
@@ -461,7 +302,7 @@ def _try_start_with(poster, token, referer, label):
                         headers=hdrs, json=body, timeout=12)
         print(f"[auth] /start [{label}] status={r.status_code} resp-len={len(r.content)}")
         ps_keys = [k for k in r.headers if "proxystate" in k.lower() or "proxy" in k.lower()]
-        print(f"[auth] /start proxy headers: {ps_keys} | all headers: {dict(r.headers)}")
+        print(f"[auth] /start proxy header names: {ps_keys}")
         ps = r.headers.get("x-hs-setproxystate") or r.headers.get("x-hs-proxystate")
         ud = r.headers.get("x-hs-setproxystate-ud") or r.headers.get("x-hs-proxystate-ud")
         if ps:
@@ -472,8 +313,7 @@ def _try_start_with(poster, token, referer, label):
         else:
             print(f"[auth] /start [{label}] — no proxystate in response headers")
             try:
-                debug_body = r.text[:500]
-                print(f"[auth] /start body preview: {debug_body!r}")
+                print("[auth] /start returned no session state")
             except Exception:
                 pass
     except Exception as e:
@@ -526,26 +366,23 @@ def extract_slug(hotstar_url):
 
     Returns (slug, content_id) or (None, None).
     """
-    hotstar_url = hotstar_url.strip()
-    # If a full URL got embedded inside itself (paste bug), take the last clean URL
-    if hotstar_url.count("hotstar.com") > 1:
-        parts = re.findall(r'https://(?:www\.)?hotstar\.com/\S+', hotstar_url)
-        if parts:
-            hotstar_url = parts[-1]
-
-    parsed = urlparse(hotstar_url if "://" in hotstar_url else "https://" + hotstar_url)
-    path   = parsed.path.strip("/")
-
+    if not isinstance(hotstar_url, str):
+        return None, None
+    try:
+        parsed = urlparse(hotstar_url.strip() if "://" in hotstar_url else "https://" + hotstar_url.strip())
+        valid_host = parsed.hostname in ("www.hotstar.com", "hotstar.com") and parsed.port in (None, 443)
+    except ValueError:
+        return None, None
+    if parsed.scheme != "https" or not valid_host or parsed.username:
+        return None, None
+    path = parsed.path.strip("/")
     for _ in range(5):
         path = re.sub(r'/(video/live/watch|live/watch|video/watch|video/live|live|watch)$', '', path)
-
-    if not path.startswith("in/"):
+    if not path.startswith("in/") or ".." in path or not re.fullmatch(r"[A-Za-z0-9_/-]+", path):
         return None, None
+    ids = re.findall(r'/(\d{9,12})(?:/|$)', path)
+    return (path, ids[-1]) if ids else (None, None)
 
-    cid_m = re.search(r'/(\d{9,12})(?:/|$)', path)
-    cid   = cid_m.group(1) if cid_m else None
-    print(f"[slug] {path}")
-    return path, cid
 
 # ---------------------------------------------------------------------------
 # BFF SLUG API  (main live stream URL fetcher)
@@ -621,7 +458,7 @@ def _extract_m3u8(d, label=""):
     raw  = json.dumps(d)
     hits = re.findall(r'https://[^"\\]+\.m3u8[^"\\]*', raw)
     if hits:
-        print(f"[bff] m3u8 via regex scan {label} -> {hits[0][:80]}...")
+        print(f"[bff] m3u8 via regex scan {label}")
         return hits[0]
 
     return None
@@ -683,11 +520,10 @@ def fetch_live_urls(slug, token, lang="eng"):
                 continue
 
             if r.status_code == 404:
-                body = r.text.strip()
-                print(f"[bff] 404 body ({len(body)} chars): {body[:200] or '(empty)'}")
+                print("[bff] content endpoint not found")
                 continue
             if r.status_code != 200:
-                print(f"[bff] error {r.status_code} body: {r.text[:300]}")
+                print(f"[bff] upstream HTTP {r.status_code}")
                 continue
 
             # A HTML response means proxystate is missing or expired
@@ -710,17 +546,13 @@ def fetch_live_urls(slug, token, lang="eng"):
             try:
                 d = r.json()
             except Exception as je:
-                print(f"[bff] json decode failed: {je} | body({len(r.content)}b): {r.text[:300]!r}")
+                print("[bff] provider returned an invalid JSON response")
                 continue
             m3u8 = _extract_m3u8(d, label=ep_label)
             if m3u8:
                 return m3u8
 
-            print(f"[bff] 200 but no m3u8 found. top keys: {list(d.keys())}")
-            debug_path = os.path.join(APP_DIR, "bff_debug.json")
-            with open(debug_path, "w") as f:
-                json.dump(d, f, indent=2)
-            print(f"[bff] full response saved to {debug_path}")
+            print("[bff] no compatible HLS stream in provider response")
 
         except Exception as e:
             import traceback
@@ -758,52 +590,57 @@ def watch(share_id):
         sess = _sessions.get(share_id)
     if not sess:
         return "link expired or invalid", 404
-    return WATCH_HTML.replace("__SHARE_ID__", share_id).replace("__TITLE__", sess.get("title","Live Stream"))
+    from html import escape
+    return WATCH_HTML.replace("__SHARE_ID__", share_id).replace("__TITLE__", escape(sess.get("title","Live Stream")))
+
+def _current_token():
+    global _TOKEN, _DEVICE_ID
+    token = load_token()
+    if token != _TOKEN:
+        _TOKEN = token
+        _DEVICE_ID = get_device_id_from_token(token) if token else str(uuid.uuid4())
+        with _proxystate_lock:
+            _proxystate.update({"value": None, "ud": None, "fetched_at": 0})
+    return token
+
 
 @app.route("/api/create", methods=["POST"])
 def api_create():
-    data  = request.json or {}
-    url   = data.get("url", "").strip()
-    lang  = data.get("lang", "eng")
-    token = _TOKEN
-
-    slug, cid = extract_slug(url)
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object."}), 400
+    slug, cid = extract_slug(data.get("url", ""))
     if not slug:
-        return jsonify({"error": f"could not parse slug from URL. got path component: {slug!r}"}), 400
-
+        return jsonify({"error": "Enter a valid https://www.hotstar.com/in/ content URL.", "code": "invalid_url"}), 400
+    lang = data.get("lang", "eng")
+    if not isinstance(lang, str) or not re.fullmatch(r"[a-z]{2,3}", lang):
+        return jsonify({"error": "Choose a valid audio language.", "code": "invalid_language"}), 400
+    token = _current_token()
+    if not auth.authenticated_token(token):
+        return jsonify({"error": "Log in to JioHotstar before opening a stream.", "code": "login_required"}), 401
     m3u8 = fetch_live_urls(slug, token, lang=lang)
     if not m3u8:
-        return jsonify({"error": "could not get stream URL. check terminal for details."}), 400
-
-    # base URL for resolving relative sub-playlist names
-    base_url = m3u8.rsplit("/", 1)[0] + "/"
-
+        return jsonify({"error": "JioHotstar did not provide a compatible HLS stream. Check the content is live and available to your account and region. DRM content requires the official player.", "code": "stream_unavailable"}), 502
+    if urlparse(m3u8).scheme not in ("https", "http"):
+        return jsonify({"error": "Provider returned an invalid stream URL."}), 502
     share_id = make_share_id()
     with _sess_lock:
         _sessions[share_id] = {
-            "slug":       slug,
-            "m3u8_url":   m3u8,
-            "base_url":   base_url,
-            "token":      token,
-            "lang":       lang,
-            "created_at": time.time(),
-            "title":      slug.split("/")[-2].replace("-", " ").title() if "/" in slug else "Live Stream",
+            "slug": slug, "m3u8_url": m3u8, "lang": lang,
+            "created_at": time.time(), "resources": {}, "resource_ids": {},
+            "title": slug.split("/")[-2].replace("-", " ").title(),
         }
-
+    base = request.host_url.rstrip("/")
     with _ngrok_lock:
         pub = _ngrok_url
-
-    local_link  = f"http://localhost:{PORT}/watch/{share_id}"
-    public_link = f"{pub}/watch/{share_id}" if pub else None
-
     return jsonify({
-        "share_id":    share_id,
-        "watch_link":  local_link,
-        "public_link": public_link,
-        "m3u8_proxy":  f"http://localhost:{PORT}/proxy/{share_id}/master.m3u8",
-        "expires_in":  "30 min (auto-refresh not yet implemented)",
+        "share_id": share_id, "watch_link": f"{base}/watch/{share_id}",
+        "public_link": f"{pub}/watch/{share_id}" if pub else None,
+        "m3u8_proxy": f"{base}/proxy/{share_id}/master.m3u8",
+        "expires_in": "Provider URLs expire; refresh this session if playback stops.",
         "ngrok_active": pub is not None,
     })
+
 
 @app.route("/api/refresh/<share_id>", methods=["POST"])
 def api_refresh(share_id):
@@ -811,18 +648,17 @@ def api_refresh(share_id):
         sess = _sessions.get(share_id)
     if not sess:
         return jsonify({"error": "session not found"}), 404
-
-    token = load_token()
-    m3u8  = fetch_live_urls(sess["slug"], token, lang=sess["lang"])
+    token = _current_token()
+    if not auth.authenticated_token(token):
+        return jsonify({"error": "Log in again before refreshing.", "code": "login_required"}), 401
+    m3u8 = fetch_live_urls(sess["slug"], token, lang=sess["lang"])
     if not m3u8:
-        return jsonify({"error": "refresh failed"}), 502
-
+        return jsonify({"error": "Stream refresh failed; check availability in the official player."}), 502
     with _sess_lock:
-        _sessions[share_id]["m3u8_url"]  = m3u8
-        _sessions[share_id]["base_url"]  = m3u8.rsplit("/", 1)[0] + "/"
-        _sessions[share_id]["refreshed"] = time.time()
-
+        sess["m3u8_url"] = m3u8
+        sess["refreshed"] = time.time()
     return jsonify({"status": "refreshed"})
+
 
 def _cdn_headers():
     """
@@ -848,171 +684,134 @@ def _cdn_headers():
         "user-agent":         _CHROME_UA,
     }
 
+def _resource_url(share_id, upstream_url, playlist=False):
+    """Register only URLs actually referenced by a provider playlist."""
+    parsed = urlparse(upstream_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username:
+        raise ValueError("Unsupported media URI in playlist")
+    key = (upstream_url, playlist)
+    with _sess_lock:
+        sess = _sessions[share_id]
+        resources = sess.setdefault("resources", {})
+        ids = sess.setdefault("resource_ids", {})
+        rid = ids.get(key)
+        if rid is None:
+            rid = uuid.uuid4().hex
+            ids[key] = rid
+            resources[rid] = key
+    return f"/proxy/{share_id}/resource/{rid}"
+
+
+def rewrite_playlist(body, base_url, share_id):
+    """Resolve against the final playlist URL, retaining every host/path/query."""
+    if not body.lstrip().startswith("#EXTM3U"):
+        raise ValueError("Provider returned an invalid HLS playlist")
+    lines = []
+    variant = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            absolute = urljoin(base_url, stripped)
+            is_playlist = variant or urlparse(absolute).path.lower().endswith(".m3u8")
+            lines.append(_resource_url(share_id, absolute, is_playlist))
+            variant = False
+            continue
+        if stripped.startswith("#EXT-X-STREAM-INF:"):
+            variant = True
+        if stripped.startswith("#"):
+            playlist_tag = stripped.startswith(("#EXT-X-MEDIA:", "#EXT-X-I-FRAME-STREAM-INF:", "#EXT-X-RENDITION-REPORT:"))
+            def replace_uri(match):
+                uri = match.group(1)
+                absolute = urljoin(base_url, uri)
+                is_playlist = playlist_tag or urlparse(absolute).path.lower().endswith(".m3u8")
+                return 'URI="' + _resource_url(share_id, absolute, is_playlist) + '"'
+            line = re.sub(r'URI="([^"\r\n]+)"', replace_uri, line)
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def _m3u8_headers():
+    headers = _cdn_headers()
+    headers["accept-encoding"] = "identity"
+    return headers
+
+
+def _stream_playlist(upstream_url, share_id):
+    response = None
+    try:
+        session, _ = _get_cdn_session()
+        response = (session or req).get(upstream_url, headers=_m3u8_headers(), timeout=20)
+        if response.status_code != 200:
+            return f"Media provider returned HTTP {response.status_code}", response.status_code
+        if re.search(r'KEYFORMAT="(?!identity")[^\"]+"', response.text):
+            return "This stream uses DRM. Open it in the official JioHotstar player.", 422
+        body = rewrite_playlist(response.text, response.url or upstream_url, share_id)
+        return Response(body, content_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"})
+    except Exception:
+        return "Could not load the media playlist. Refresh the stream and try again.", 502
+    finally:
+        if response is not None:
+            response.close()
+
+
 @app.route("/proxy/<share_id>/master.m3u8")
 def proxy_master(share_id):
     with _sess_lock:
         sess = _sessions.get(share_id)
     if not sess:
         return "session expired", 404
+    return _stream_playlist(sess["m3u8_url"], share_id)
 
-    try:
-        cdn_s, _ = _get_cdn_session()
-        fetcher = cdn_s if cdn_s else req
-        r = fetcher.get(sess["m3u8_url"],
-                        headers=_cdn_headers(),
-                        timeout=10)
-        if r.status_code != 200:
-            print(f"[cdn] master.m3u8 {r.status_code} from {sess['m3u8_url'][:80]}")
-            print(f"[cdn] response body: {r.text[:400]}")
-            return f"upstream {r.status_code}", r.status_code
 
-        master = r.text
-        base_url = sess["m3u8_url"].rsplit("/", 1)[0] + "/"
-
-        def rewrite_line(line):
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                if stripped.startswith("http"):
-                    # absolute sub-playlist URL — route through sub proxy
-                    from urllib.parse import urlparse as _up2
-                    pu = _up2(stripped)
-                    fname = pu.path.lstrip("/").split("/")[-1]
-                    if pu.query:
-                        fname += "?" + pu.query
-                    return f"/proxy/{share_id}/sub/{fname}\n"
-                else:
-                    # relative sub-playlist name (e.g. index_2.m3u8)
-                    return f"/proxy/{share_id}/sub/{stripped}\n"
-            return line + "\n" if not line.endswith("\n") else line
-
-        rewritten = "".join(rewrite_line(l) for l in master.splitlines())
-
-        return Response(rewritten, content_type="application/vnd.apple.mpegurl",
-                        headers={"Access-Control-Allow-Origin": "*",
-                                 "Cache-Control": "no-cache"})
-    except Exception as e:
-        return str(e), 502
-
-@app.route("/proxy/<share_id>/sub/<path:filename>")
-def proxy_sub(share_id, filename):
+@app.route("/proxy/<share_id>/resource/<resource_id>")
+def proxy_resource(share_id, resource_id):
     with _sess_lock:
         sess = _sessions.get(share_id)
-    if not sess:
-        return "session expired", 404
+        resource = sess.get("resources", {}).get(resource_id) if sess else None
+    if not resource:
+        return "media resource not found", 404
+    upstream_url, playlist = resource
+    return _stream_playlist(upstream_url, share_id) if playlist else _stream_from(upstream_url)
 
-    sub_url = urljoin(sess["base_url"], filename)
-    return _stream_playlist(sub_url, share_id)
-
-@app.route("/proxy/<share_id>/seg/<path:filename>")
-def proxy_seg(share_id, filename):
-    """
-    Proxy .ts segments through Flask — browsers can't hit CDN directly due to CORS.
-
-    filename carries the full CDN path (leading slash stripped).
-    urljoin would double the path against base_url, so we reconstruct from CDN root.
-    Flask strips the query string from <path:filename>, so re-attach from request.
-    """
-    with _sess_lock:
-        sess = _sessions.get(share_id)
-    if not sess:
-        return "session expired", 404
-
-    pu = urlparse(sess["base_url"])
-    cdn_root = f"{pu.scheme}://{pu.netloc}"
-    seg_url = f"{cdn_root}/{filename}"
-    qs = request.query_string.decode("utf-8")
-    if qs:
-        seg_url += "?" + qs
-    return _stream_from(seg_url)
-
-@app.route("/proxy/<share_id>/abs/<path:encoded>")
-def proxy_abs(share_id, encoded):
-    url = unquote(encoded)
-    if not url.startswith("http"):
-        url = "https://" + url
-    return _stream_from(url)
-
-def _m3u8_headers():
-    """CDN headers for m3u8 text fetches — identity encoding keeps r.text clean."""
-    h = _cdn_headers().copy()
-    h["accept-encoding"] = "identity"
-    return h
-
-def _stream_playlist(upstream_url, share_id):
-    """
-    Fetch a sub-playlist and rewrite .ts segment URLs to go through
-    /proxy/{share_id}/seg/... so the browser never hits CDN directly (CORS block).
-    """
-    try:
-        cdn_s, _ = _get_cdn_session()
-        fetcher = cdn_s if cdn_s else req
-
-        r = fetcher.get(upstream_url, headers=_m3u8_headers(), timeout=15)
-        if r.status_code != 200:
-            print(f"[cdn] playlist {r.status_code}: {upstream_url[-60:]}")
-            return f"upstream {r.status_code}", r.status_code
-
-        text = r.text
-        base = upstream_url.split("?")[0].rsplit("/", 1)[0] + "/"
-        lines = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                if stripped.startswith("http"):
-                    abs_url = stripped
-                else:
-                    abs_url = urljoin(base, stripped)
-                from urllib.parse import urlparse as _up, urlencode, parse_qs
-                pu = _up(abs_url)
-                seg_path = pu.path.lstrip("/")
-                seg_proxy = f"/proxy/{share_id}/seg/{seg_path}"
-                if pu.query:
-                    seg_proxy += "?" + pu.query
-                lines.append(seg_proxy)
-            else:
-                lines.append(line)
-
-        body = "\n".join(lines)
-        return Response(body, content_type="application/vnd.apple.mpegurl",
-                        headers={"Access-Control-Allow-Origin": "*",
-                                 "Cache-Control": "no-cache"})
-    except Exception as e:
-        print(f"[cdn] playlist error: {e}")
-        return str(e), 502
 
 def _seg_headers():
-    """
-    Headers for .ts segment fetches.
-    identity encoding is required — gzip/br would corrupt the MPEG-TS bytes
-    that the browser media decoder reads directly.
-    """
-    h = _cdn_headers().copy()
-    h["accept-encoding"] = "identity"
-    return h
+    headers = _m3u8_headers()
+    for name in ("Range", "If-Range"):
+        if request.headers.get(name):
+            headers[name] = request.headers[name]
+    return headers
+
 
 def _stream_from(upstream_url):
-    """Stream binary content (segments) from CDN through Flask."""
+    """Relay media including fMP4 init fragments and byte-range responses."""
+    response = None
     try:
-        cdn_s, _ = _get_cdn_session()
-        fetcher = cdn_s if cdn_s else req
-
-        r = fetcher.get(upstream_url, headers=_seg_headers(), timeout=20, stream=True)
-        if r.status_code != 200:
-            print(f"[cdn] seg {r.status_code}: {upstream_url[-60:]}")
-            return f"upstream {r.status_code}", r.status_code
-
-        ct = r.headers.get("Content-Type", "video/MP2T")
-
+        session, _ = _get_cdn_session()
+        response = (session or req).get(upstream_url, headers=_seg_headers(), timeout=20, stream=True)
+        if response.status_code not in (200, 206):
+            status = response.status_code
+            response.close()
+            return f"Media provider returned HTTP {status}", status
+        headers = {"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"}
+        for name in ("Content-Length", "Content-Range", "Accept-Ranges"):
+            value = response.headers.get(name)
+            if value:
+                headers[name] = value
         def generate():
-            for chunk in r.iter_content(65536):
-                yield chunk
-
-        return Response(generate(), content_type="video/MP2T",
-                        headers={"Access-Control-Allow-Origin": "*",
-                                 "Cache-Control": "no-cache"})
-    except Exception as e:
-        print(f"[cdn] stream error: {e}")
-        return str(e), 502
+            try:
+                for chunk in response.iter_content(65536):
+                    if chunk:
+                        yield chunk
+            finally:
+                response.close()
+        result = Response(generate(), status=response.status_code,
+                          content_type=response.headers.get("Content-Type", "application/octet-stream"), headers=headers)
+        result.call_on_close(response.close)
+        return result
+    except Exception:
+        if response is not None:
+            response.close()
+        return "Could not load media data. Refresh the stream and try again.", 502
 
 @app.route("/api/ngrok/status")
 def api_ngrok_status():
@@ -1049,57 +848,55 @@ def api_ngrok_restart():
 
 @app.route("/api/token/status")
 def api_token_status():
-    global _TOKEN, _DEVICE_ID
-    if _TOKEN and tok_valid(_TOKEN):
-        return jsonify({"status": "valid", "remaining": tok_remaining(_TOKEN), "has_token": True})
-    if _TOKEN:
-        return jsonify({"status": "expired", "remaining": "expired", "has_token": True})
-    return jsonify({"status": "none", "remaining": "", "has_token": False})
+    _current_token()
+    return jsonify(auth.token_status())
+
+
+@app.route("/api/hotstar/live")
+def api_hotstar_live():
+    from hotstar_catalogue import discover_live_events, CatalogueError
+    try:
+        return jsonify(discover_live_events(_current_token(), refresh=request.args.get("refresh") == "1"))
+    except CatalogueError as exc:
+        return jsonify({"error": str(exc), "code": "catalogue_unavailable"}), exc.status
+
 
 @app.route("/api/login/send_otp", methods=["POST"])
 def api_login_send_otp():
-    data  = request.json or {}
-    phone = data.get("phone","").strip()
-    if not phone or not phone.isdigit() or len(phone) != 10:
-        return jsonify({"error": "enter a valid 10-digit phone number"}), 400
-    guest, ps, method = api_guest_token()
-    if not guest:
-        return jsonify({"error": "could not get guest token from Hotstar"}), 502
-    ok, used_method = api_send_otp(phone, guest, ps, method)
-    if not ok:
-        return jsonify({"error": "OTP send failed"}), 502
-    _login_state[phone] = {"guest": guest, "ps": ps, "method": used_method or method}
-    return jsonify({"status": "otp_sent"})
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object."}), 400
+    try:
+        auth.begin_login(data.get("phone", ""))
+        return jsonify({"status": "otp_sent"})
+    except auth.AuthError as exc:
+        return jsonify({"error": str(exc), "code": exc.code}), exc.status
+
+
+@app.route("/api/login/pending")
+def api_login_pending():
+    return jsonify(auth.pending_login())
+
 
 @app.route("/api/login/verify_otp", methods=["POST"])
 def api_login_verify_otp():
-    global _TOKEN, _DEVICE_ID
-    data  = request.json or {}
-    phone = data.get("phone","").strip()
-    otp   = data.get("otp","").strip()
-    state = _login_state.get(phone)
-    if not state:
-        return jsonify({"error": "send OTP first"}), 400
-    tok = api_verify_otp(phone, otp, state["guest"], state["ps"], state["method"])
-    if not tok:
-        return jsonify({"error": "wrong OTP or OTP expired"}), 401
-    save_token_file(tok, phone)
-    _TOKEN    = tok
-    _DEVICE_ID = get_device_id_from_token(tok)
-    _login_state.pop(phone, None)
-    return jsonify({"status": "logged_in", "remaining": tok_remaining(tok)})
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object."}), 400
+    try:
+        token = auth.finish_login(data.get("phone", ""), data.get("otp", ""))
+        _current_token()
+        return jsonify({"status": "logged_in", "remaining": tok_remaining(token)})
+    except auth.AuthError as exc:
+        return jsonify({"error": str(exc), "code": exc.code}), exc.status
+
 
 @app.route("/api/login/use_existing", methods=["POST"])
 def api_login_use_existing():
-    global _TOKEN, _DEVICE_ID
-    tok = load_token()
-    if not tok:
-        return jsonify({"error": "no token file found"}), 404
-    if not tok_valid(tok):
-        return jsonify({"error": f"token expired ({tok_remaining(tok)}), please login again"}), 401
-    _TOKEN    = tok
-    _DEVICE_ID = get_device_id_from_token(tok)
-    return jsonify({"status": "loaded", "remaining": tok_remaining(tok)})
+    token = _current_token()
+    if not auth.authenticated_token(token):
+        return jsonify({"error": "No valid saved token. Log in again.", "code": "login_required"}), 401
+    return jsonify({"status": "loaded", "remaining": tok_remaining(token)})
 
 @app.route("/api/sessions")
 def api_sessions():
@@ -1112,7 +909,7 @@ def api_sessions():
                 "title":      s.get("title",""),
                 "lang":       s.get("lang",""),
                 "age_min":    round((now - s["created_at"]) / 60, 1),
-                "watch_link": f"http://localhost:{PORT}/watch/{sid}",
+                "watch_link": f"{request.host_url.rstrip('/')}/watch/{sid}",
             })
     return jsonify(out)
 
@@ -1124,7 +921,7 @@ HOST_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Hotstar Relay</title>
+<title>Debloated Streaming</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:28px 16px;gap:20px}
@@ -1193,7 +990,7 @@ button.btn-primary:disabled{opacity:.4;cursor:not-allowed}
 </head>
 <body>
 
-<h1>Hotstar <span>Live Relay</span></h1>
+<h1>Debloated <span>Streaming</span></h1>
 
 <!-- TAB BAR -->
 <div class="tabs">
@@ -1375,7 +1172,7 @@ async function sendOtp() {
     });
     const d = await r.json();
     if (d.error) { log(d.error, 'err', 'loginLog'); return; }
-    log('OTP sent. Check your phone.', 'ok', 'loginLog');
+    log('Hotstar accepted the OTP request. Check your SMS.', 'ok', 'loginLog');
     document.getElementById('otpSection').style.display = 'block';
     document.getElementById('otpInput').focus();
   } catch(e) { log(e.message, 'err', 'loginLog'); }
@@ -1819,16 +1616,16 @@ if __name__ == "__main__":
         else:
             print(f"\n  [ngrok] no tunnel — paste authtoken in the web UI to enable\n")
 
-    threading.Thread(target=_ngrok_startup, daemon=True).start()
+    if os.environ.get("HOTSTAR_ENABLE_TUNNEL") == "1":
+        threading.Thread(target=_ngrok_startup, daemon=True).start()
     atexit.register(stop_ngrok)
 
     print(f"""
-  Hotstar Live Relay  v3
+  Debloated Streaming — Hotstar Relay
   ----------------------
   you:     http://localhost:{PORT}
-  LAN:     http://{local_ip}:{PORT}/watch/<id>  (after you create a link)
-  friends: set ngrok token in the web UI -> get a public link
+  playback: local browser, MPV or VLC through this service
   Ctrl+C to stop
 """)
     threading.Thread(target=lambda: (time.sleep(1.5), webbrowser.open(f"http://localhost:{PORT}")), daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
