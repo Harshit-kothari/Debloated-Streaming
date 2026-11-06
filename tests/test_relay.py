@@ -259,5 +259,68 @@ segment.m4s?sig=seg%2F1
             self.assertEqual(called_platforms[0], 'android')
 
 
+    def test_has_premium_web_subscription(self):
+        import base64
+        def make_jwt(sub_dict):
+            payload = {'exp': time.time() + 3600, 'sub': json.dumps(sub_dict)}
+            encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+            return 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        # Free / unsubscribed accounts
+        empty_tok = make_jwt({})
+        self.assertFalse(live._has_premium_web_subscription(empty_tok))
+        empty_in_tok = make_jwt({'subscriptions': {'in': {}}})
+        self.assertFalse(live._has_premium_web_subscription(empty_in_tok))
+
+        # Mobile only
+        mobile_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}}}})
+        self.assertFalse(live._has_premium_web_subscription(mobile_tok))
+
+        # Super / Premium Web
+        super_tok = make_jwt({'subscriptions': {'in': {'HotstarSuper': {'status': 'S'}}}})
+        self.assertTrue(live._has_premium_web_subscription(super_tok))
+
+        combo_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}, 'HotstarPremium': {'status': 'S'}}}})
+        self.assertTrue(live._has_premium_web_subscription(combo_tok))
+
+    def test_fetch_live_urls_uses_android_profile_for_free_account(self):
+        import base64
+        payload = {'exp': time.time() + 3600, 'sub': json.dumps({'subscriptions': {'in': {}}})}
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+        free_tok = 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        called_platforms = []
+        def mock_bff_get(url, hdrs, params, label):
+            called_platforms.append(hdrs.get('x-hs-platform'))
+            resp = Mock(status_code=200, text='{"success": {}}')
+            resp.json.return_value = {
+                'success': {
+                    'page': {
+                        'spaces': {
+                            'player': {
+                                'widget_wrappers': [{
+                                    'widget': {
+                                        'data': {
+                                            'player_config': {
+                                                'media_asset': {
+                                                    'primary': {'content_url': 'https://cdn.example/free_live.m3u8'}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }
+            return resp, False
+
+        with patch.object(live, 'get_proxystate', return_value=('ps_val', 'ps_ud_val')), patch.object(live, '_do_bff_get', side_effect=mock_bff_get):
+            m3u8 = live.fetch_live_urls('in/shows/foo/1271698292', free_tok)
+            self.assertEqual(m3u8, 'https://cdn.example/free_live.m3u8')
+            self.assertEqual(called_platforms[0], 'android')
+
+
 if __name__ == '__main__':
     unittest.main()

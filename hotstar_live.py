@@ -494,6 +494,30 @@ _CLIENT_ANDROID = (
 )
 
 
+def _has_premium_web_subscription(token):
+    """Detect if the authenticated token possesses an active non-mobile web subscription."""
+    if not token:
+        return False
+    try:
+        claims = auth._subject(token)
+        subs = claims.get("subscriptions", {})
+        if isinstance(subs, str):
+            try:
+                subs = json.loads(subs)
+            except Exception:
+                subs = {}
+        if isinstance(subs, dict):
+            for region, plans in subs.items():
+                if isinstance(plans, dict):
+                    for plan_name, info in plans.items():
+                        if isinstance(info, dict) and info.get("status") in ("S", "A"):
+                            if "mobile" not in plan_name.lower():
+                                return True
+    except Exception:
+        pass
+    return False
+
+
 def _is_mobile_only_token(token):
     """Detect if the authenticated token only possesses a mobile subscription."""
     if not token:
@@ -568,7 +592,7 @@ def fetch_live_urls(slug, token, lang="eng"):
         f"{base}/watch",              # fallback
     ]
 
-    profiles = ["android", "web"] if _is_mobile_only_token(token) else ["web", "android"]
+    profiles = ["web", "android"] if _has_premium_web_subscription(token) else ["android", "web"]
 
     for profile in profiles:
         print(f"[bff] trying profile={profile} for {slug}")

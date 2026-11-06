@@ -13,7 +13,7 @@
     "doctor": "node index.js --doctor",
     "login": "node index.js --login",
     "web": "node scripts/run-python.js hotstar_live.py",
-    "setup": "node scripts/run-python.js -m pip install -r Requirements.txt",
+    "setup": "node scripts/setup.js",
     "test": "node --test tests/*.test.js && node scripts/run-python.js -m unittest discover -s tests -p test_*.py"
   },
   "dependencies": {
