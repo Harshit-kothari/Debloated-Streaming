@@ -34,11 +34,11 @@ The original commit histories of both foundation projects are preserved alongsid
 
 Install **Node.js 22+**, **Python 3.9+**, and either [MPV](https://mpv.io/installation/) or [VLC](https://www.videolan.org/vlc/).
 
-```powershell
+```bash
 git clone https://github.com/Harshit-kothari/Debloated-Streaming.git
 cd Debloated-Streaming
 npm install
-python -m pip install -r Requirements.txt
+npm run setup
 node index.js
 ```
 

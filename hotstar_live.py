@@ -471,7 +471,10 @@ def _do_bff_get(url, hdrs, params, label):
     cdn_s, target = _get_cdn_session()
     if cdn_s is not None:
         try:
-            r = cdn_s.get(url, headers=hdrs, params=params, timeout=15)
+            # Overriding accept-encoding with curl_cffi impersonate triggers curl: (23) CURLE_WRITE_ERROR.
+            # Omit accept-encoding so curl_cffi handles browser decompression automatically.
+            cffi_hdrs = {k: v for k, v in hdrs.items() if k.lower() != "accept-encoding"}
+            r = cdn_s.get(url, headers=cffi_hdrs, params=params, timeout=15)
             print(f"[bff] [{label}] curl_cffi/{target} status={r.status_code} len={len(r.content)}")
             return r, True
         except Exception as e:
@@ -484,10 +487,72 @@ def _do_bff_get(url, hdrs, params, label):
         print(f"[bff] [{label}] requests error: {e}")
     return None, False
 
+_CLIENT_ANDROID = (
+    "platform:android;app_id:in.startv.hotstar;app_version:26.09.05.0;"
+    "os:Android;os_version:14;schema_version:0.0.1797;brand:Samsung;"
+    "model:SM-S918B;carrier:airtel;network_data:NETWORK_TYPE_WIFI"
+)
+
+
+def _is_mobile_only_token(token):
+    """Detect if the authenticated token only possesses a mobile subscription."""
+    if not token:
+        return False
+    try:
+        claims = auth._subject(token)
+        subs = claims.get("subscriptions", {})
+        if isinstance(subs, str):
+            try:
+                subs = json.loads(subs)
+            except Exception:
+                subs = {}
+        if isinstance(subs, dict):
+            has_mobile = False
+            has_other = False
+            for region, plans in subs.items():
+                if isinstance(plans, dict):
+                    for plan_name, info in plans.items():
+                        if isinstance(info, dict) and info.get("status") in ("S", "A"):
+                            if "mobile" in plan_name.lower():
+                                has_mobile = True
+                            else:
+                                has_other = True
+            if has_mobile and not has_other:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _bff_headers_for_profile(token, ps, ps_ud, slug, lang, profile="web"):
+    hdrs = _bff_headers(token, ps, ps_ud, slug, lang)
+    if profile == "android":
+        hdrs["x-hs-platform"] = "android"
+        hdrs["x-hs-client"] = _CLIENT_ANDROID
+        hdrs["x-hs-app"] = "11013"
+    return hdrs
+
+
+def _bff_params_for_profile(lang, profile="web"):
+    caps = json.loads(_CLIENT_CAPS)
+    if profile == "android":
+        caps["ladder"] = ["phone", "tv", "web"]
+    else:
+        caps["ladder"] = ["web", "tv", "phone"]
+    return {
+        "client_capabilities": json.dumps(caps, separators=(",", ":")),
+        "drm_parameters":      _DRM_PARAMS,
+        "request_features":    "consent_supported",
+        "lang":                lang,
+    }
+
+
 def fetch_live_urls(slug, token, lang="eng"):
     """
-    Try multiple BFF endpoint variants — sports uses /video/live/watch,
-    shows/channels may use /video/watch or /watch.
+    Try multiple BFF endpoint variants across compatible platform profiles.
+    Accounts with mobile-only subscriptions (like JHSMobileLite) require
+    the Android profile to receive playback entitlements; other accounts
+    try web first, then fall back to Android.
     Returns an m3u8 URL string or None.
     """
     ps, ps_ud = get_proxystate(token, referer=f"https://www.hotstar.com/{slug}")
@@ -496,14 +561,6 @@ def fetch_live_urls(slug, token, lang="eng"):
     else:
         print(f"[bff] using proxystate (len={len(ps)})")
 
-    hdrs   = _bff_headers(token, ps, ps_ud, slug, lang)
-    params = {
-        "client_capabilities": _CLIENT_CAPS,
-        "drm_parameters":      _DRM_PARAMS,
-        "request_features":    "consent_supported",
-        "lang":                lang,
-    }
-
     base = f"https://www.hotstar.com/api/internal/bff/v2/slugs/{slug}"
     endpoints = [
         f"{base}/live/watch",         # HAR confirmed for shows/channels (BB 24x7)
@@ -511,53 +568,60 @@ def fetch_live_urls(slug, token, lang="eng"):
         f"{base}/watch",              # fallback
     ]
 
-    for ep in endpoints:
-        ep_label = ep.split("/bff/v2/slugs/")[-1]
-        print(f"[bff] trying {ep_label} lang={lang}")
-        try:
-            r, used_cffi = _do_bff_get(ep, hdrs, params, ep_label)
-            if r is None:
-                continue
+    profiles = ["android", "web"] if _is_mobile_only_token(token) else ["web", "android"]
 
-            if r.status_code == 404:
-                print("[bff] content endpoint not found")
-                continue
-            if r.status_code != 200:
-                print(f"[bff] upstream HTTP {r.status_code}")
-                continue
+    for profile in profiles:
+        print(f"[bff] trying profile={profile} for {slug}")
+        hdrs = _bff_headers_for_profile(token, ps, ps_ud, slug, lang, profile=profile)
+        params = _bff_params_for_profile(lang, profile=profile)
 
-            # A HTML response means proxystate is missing or expired
-            if r.text.lstrip().startswith("<!DOCTYPE") or r.text.lstrip().startswith("<html"):
-                print(f"[bff] got HTML response ({len(r.content)}b) — proxystate missing/expired, forcing refresh")
-                with _proxystate_lock:
-                    _proxystate["fetched_at"] = 0
-                ps, ps_ud = get_proxystate(token, referer=f"https://www.hotstar.com/{slug}")
-                if ps:
-                    hdrs = _bff_headers(token, ps, ps_ud, slug, lang)
-                    r, used_cffi = _do_bff_get(ep, hdrs, params, ep_label + "_retry")
-                    if r is None or r.status_code != 200:
-                        continue
-                    if r.text.lstrip().startswith("<"):
-                        print(f"[bff] still HTML after proxystate refresh — Hotstar blocking")
-                        continue
-                else:
+        for ep in endpoints:
+            ep_label = f"{ep.split('/bff/v2/slugs/')[-1]}_{profile}"
+            print(f"[bff] trying {ep_label} lang={lang}")
+            try:
+                r, used_cffi = _do_bff_get(ep, hdrs, params, ep_label)
+                if r is None:
                     continue
 
-            try:
-                d = r.json()
-            except Exception as je:
-                print("[bff] provider returned an invalid JSON response")
-                continue
-            m3u8 = _extract_m3u8(d, label=ep_label)
-            if m3u8:
-                return m3u8
+                if r.status_code == 404:
+                    print("[bff] content endpoint not found")
+                    continue
+                if r.status_code != 200:
+                    print(f"[bff] upstream HTTP {r.status_code}")
+                    continue
 
-            print("[bff] no compatible HLS stream in provider response")
+                # A HTML response means proxystate is missing or expired
+                if r.text.lstrip().startswith("<!DOCTYPE") or r.text.lstrip().startswith("<html"):
+                    print(f"[bff] got HTML response ({len(r.content)}b) — proxystate missing/expired, forcing refresh")
+                    with _proxystate_lock:
+                        _proxystate["fetched_at"] = 0
+                    ps, ps_ud = get_proxystate(token, referer=f"https://www.hotstar.com/{slug}")
+                    if ps:
+                        hdrs = _bff_headers_for_profile(token, ps, ps_ud, slug, lang, profile=profile)
+                        r, used_cffi = _do_bff_get(ep, hdrs, params, ep_label + "_retry")
+                        if r is None or r.status_code != 200:
+                            continue
+                        if r.text.lstrip().startswith("<"):
+                            print(f"[bff] still HTML after proxystate refresh — Hotstar blocking")
+                            continue
+                    else:
+                        continue
 
-        except Exception as e:
-            import traceback
-            print(f"[bff] exception: {e}")
-            traceback.print_exc()
+                try:
+                    d = r.json()
+                except Exception:
+                    print("[bff] provider returned an invalid JSON response")
+                    continue
+                m3u8 = _extract_m3u8(d, label=ep_label)
+                if m3u8:
+                    return m3u8
+
+                print(f"[bff] no compatible HLS stream in provider response ({ep_label})")
+
+            except Exception as e:
+                import traceback
+                print(f"[bff] exception: {e}")
+                traceback.print_exc()
 
     return None
 

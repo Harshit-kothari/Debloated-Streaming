@@ -154,6 +154,77 @@ segment.m4s?sig=seg%2F1
         for route in ('/api/create', '/api/login/send_otp', '/api/login/verify_otp'):
             self.assertEqual(self.client.post(route, json=['bad']).status_code, 400)
 
+    def test_is_mobile_only_token_detection(self):
+        import base64
+        def make_jwt(sub_dict):
+            payload = {'exp': time.time() + 3600, 'sub': json.dumps(sub_dict)}
+            encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+            return 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        mobile_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}}}})
+        self.assertTrue(live._is_mobile_only_token(mobile_tok))
+
+        super_tok = make_jwt({'subscriptions': {'in': {'HotstarSuper': {'status': 'S'}}}})
+        self.assertFalse(live._is_mobile_only_token(super_tok))
+
+        combo_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}, 'HotstarPremium': {'status': 'S'}}}})
+        self.assertFalse(live._is_mobile_only_token(combo_tok))
+
+        empty_tok = make_jwt({})
+        self.assertFalse(live._is_mobile_only_token(empty_tok))
+        self.assertFalse(live._is_mobile_only_token(None))
+
+    def test_do_bff_get_omits_accept_encoding_for_cffi(self):
+        mock_session = Mock()
+        mock_resp = Mock(status_code=200, content=b'{"ok": true}')
+        mock_session.get.return_value = mock_resp
+        with patch.object(live, '_get_cdn_session', return_value=(mock_session, 'mock_target')):
+            headers = {'accept': 'application/json', 'accept-encoding': 'gzip, deflate'}
+            resp, used_cffi = live._do_bff_get('https://example.com/api', headers, {}, 'test')
+            self.assertTrue(used_cffi)
+            self.assertEqual(resp, mock_resp)
+            passed_headers = mock_session.get.call_args.kwargs['headers']
+            self.assertNotIn('accept-encoding', passed_headers)
+            self.assertIn('accept', passed_headers)
+
+    def test_fetch_live_urls_uses_android_profile_for_mobile_token(self):
+        import base64
+        payload = {'exp': time.time() + 3600, 'sub': json.dumps({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}}}})}
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+        mobile_tok = 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        called_platforms = []
+        def mock_bff_get(url, hdrs, params, label):
+            called_platforms.append(hdrs.get('x-hs-platform'))
+            resp = Mock(status_code=200, text='{"success": {}}')
+            resp.json.return_value = {
+                'success': {
+                    'page': {
+                        'spaces': {
+                            'player': {
+                                'widget_wrappers': [{
+                                    'widget': {
+                                        'data': {
+                                            'player_config': {
+                                                'media_asset': {
+                                                    'primary': {'content_url': 'https://cdn.example/live.m3u8'}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }
+            return resp, False
+
+        with patch.object(live, 'get_proxystate', return_value=('ps_val', 'ps_ud_val')), patch.object(live, '_do_bff_get', side_effect=mock_bff_get):
+            m3u8 = live.fetch_live_urls('in/shows/foo/1271698292', mobile_tok)
+            self.assertEqual(m3u8, 'https://cdn.example/live.m3u8')
+            self.assertEqual(called_platforms[0], 'android')
+
 
 if __name__ == '__main__':
     unittest.main()
