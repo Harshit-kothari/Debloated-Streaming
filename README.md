@@ -24,25 +24,107 @@ The original commit histories of both foundation projects are preserved alongsid
 ## What it does
 
 - Lists live and upcoming Fancode and SonyLiv events alongside live entries discovered directly from your Hotstar catalogue.
-- Keeps live entries red and shows whether your Hotstar login has expired at the top.
+- **No Paid Subscription Required**: SonyLiv and Fancode streams are 100% free with no login needed. Free JioHotstar events and live matches stream without a paid subscription (just log in with your free phone OTP; Android profile entitlements are used).
+- Automatically selects the highest quality stream variant (1080p/720p) for every live stream.
+- Prevents live edge stuttering and reloading through optimized low-latency MPV buffer cushions and cache management.
 - Supports phone/OTP login inside the terminal, pending OTP resumption, and resend cooldowns.
-- Finds MPV and VLC through common installation locations, portable tools, or executable overrides.
+- Finds MPV and VLC through common installation locations across Windows, macOS, and Linux.
 - Relays nested HLS playlists, audio tracks, init fragments, and byte ranges through a local service.
-- Fetches fresh Hotstar playback URLs when you select an event.
 
-## Quick start
+## Cross-Platform Installation & Quick Start
 
-Install **Node.js 22+**, **Python 3.9+**, and either [MPV](https://mpv.io/installation/) or [VLC](https://www.videolan.org/vlc/).
+Requirements: **Node.js 22+**, **Python 3.9+**, and either **MPV** (recommended) or **VLC**.
 
+### 1-Click Install
+
+* **macOS / Linux**:
+  ```bash
+  git clone https://github.com/Harshit-kothari/Debloated-Streaming.git
+  cd Debloated-Streaming
+  ./install.sh
+  npm start
+  ```
+
+* **Windows (PowerShell)**:
+  ```powershell
+  git clone https://github.com/Harshit-kothari/Debloated-Streaming.git
+  cd Debloated-Streaming
+  .\install.ps1
+  npm start
+  ```
+
+---
+
+### Platform-Specific Setup
+
+#### Windows
+Install prerequisites using **winget**:
 ```powershell
-git clone https://github.com/Harshit-kothari/Debloated-Streaming.git
-cd Debloated-Streaming
+# Install Node.js
+winget install OpenJS.NodeJS.LTS
+
+# Install Python
+winget install Python.Python.3.12
+
+# Install MPV (recommended) or VLC
+winget install mpv.net
+# or: winget install VideoLAN.VLC
+```
+Then run:
+```powershell
 npm install
-python -m pip install -r Requirements.txt
-node index.js
+npm run setup
+npm start
 ```
 
-Run `node index.js --doctor` to check your Python dependencies, players, local relay, and saved login.
+#### macOS
+Install prerequisites using **Homebrew**:
+```bash
+# Install Node.js and Python
+brew install node python
+
+# Install MPV (recommended) or VLC
+brew install mpv
+# or: brew install --cask vlc
+```
+Then run:
+```bash
+npm install
+npm run setup
+npm start
+```
+
+#### Linux (Ubuntu / Debian / Mint)
+```bash
+# Install Node.js (via NodeSource or system), Python and MPV
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv mpv
+
+# Install dependencies and setup
+npm install
+npm run setup
+npm start
+```
+
+#### Linux (Fedora / RHEL)
+```bash
+sudo dnf install -y python3 python3-pip mpv
+npm install
+npm run setup
+npm start
+```
+
+#### Linux (Arch Linux)
+```bash
+sudo pacman -S python python-pip mpv
+npm install
+npm run setup
+npm start
+```
+
+---
+
+Run `node index.js --doctor` anytime to check your Python runtime, dependencies, players, local relay, and saved login status.
 
 Player binaries and account credentials are not bundled. A portable MPV installation can be placed at `tools/mpv/mpv.exe` on Windows. You can also point to an installed executable:
 

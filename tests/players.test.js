@@ -55,6 +55,14 @@ test('HTTP headers and URL remain separate arguments, with literal commas preser
   assert.throws(() => buildPlayerArgs(mpv, url, { headers: { Origin: 'value\r\nInjected: header' } }), /Invalid playback HTTP header/);
 });
 
+test('default MPV configuration optimizes live streaming buffers and selects maximum bitrate', () => {
+  const defaultMpv = { key: 'mpv' };
+  const args = buildPlayerArgs(defaultMpv, 'https://example.com/live.m3u8');
+  assert.ok(args.includes('--hls-bitrate=max'));
+  assert.ok(args.includes('--cache-pause=no'));
+  assert.ok(args.includes('--demuxer-lavf-o=live_start_index=-4'));
+});
+
 test('VLC receives its supported UA and referrer flags and reports unsupported headers', () => {
   const player = { key: 'vlc', args: [] };
   assert.deepEqual(buildPlayerArgs(player, 'https://example.com/live', { headers: { 'User-Agent': 'Agent', Referer: 'https://example.com' } }), ['--http-user-agent=Agent', '--http-referrer=https://example.com', '--', 'https://example.com/live']);

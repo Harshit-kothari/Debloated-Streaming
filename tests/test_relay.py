@@ -46,12 +46,45 @@ class RelayTests(unittest.TestCase):
         with patch.object(live, '_get_cdn_session', return_value=(fetcher, 'mock')):
             result = self.client.get('/proxy/fixture/master.m3u8')
         self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.headers.get('Cache-Control'), 'no-cache, no-store, must-revalidate, max-age=0')
+        self.assertEqual(result.headers.get('Pragma'), 'no-cache')
         lines = result.text.splitlines()
         audio_path = lines[1].split('URI="')[1].split('"')[0]
         self.assertEqual(self.resource(audio_path), ('https://audio.example/a/hi.m3u8?sig=a%2Fb&n=2', True))
         self.assertEqual(self.resource(lines[3]), ('https://redirect.example/video/v1.m3u8?sig=video', True))
         fetcher.get.assert_called_once_with('https://cdn.example/root/master.m3u8?master=1', headers=live._m3u8_headers(), timeout=20)
         self.assertTrue(upstream.closed)
+
+    def test_master_sorts_variants_highest_quality_first(self):
+        source = '''#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",URI="https://audio.example/audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=320x180,AUDIO="audio"
+180p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,AUDIO="audio"
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,AUDIO="audio"
+360p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=96000,CODECS="mp4a.40.2"
+audio_only.m3u8
+'''
+        rewritten = live.rewrite_playlist(source, 'https://cdn.example/live/master.m3u8', 'fixture')
+        lines = rewritten.splitlines()
+        self.assertEqual(lines[0], '#EXTM3U')
+        self.assertEqual(lines[1], '#EXT-X-VERSION:3')
+        self.assertTrue(lines[2].startswith('#EXT-X-MEDIA:'))
+        # First variant must be 720p (highest bandwidth)
+        self.assertIn('RESOLUTION=1280x720', lines[3])
+        self.assertTrue(lines[4].startswith('/proxy/fixture/resource/'))
+        # Second variant must be 360p
+        self.assertIn('RESOLUTION=640x360', lines[5])
+        self.assertTrue(lines[6].startswith('/proxy/fixture/resource/'))
+        # Third variant must be 180p
+        self.assertIn('RESOLUTION=320x180', lines[7])
+        self.assertTrue(lines[8].startswith('/proxy/fixture/resource/'))
+        # Audio-only variant without resolution must be last
+        self.assertIn('BANDWIDTH=96000', lines[9])
+        self.assertTrue(lines[10].startswith('/proxy/fixture/resource/'))
 
     def test_media_playlist_rewrites_fmp4_key_and_segments(self):
         body = '''#EXTM3U
@@ -153,6 +186,140 @@ segment.m4s?sig=seg%2F1
     def test_malformed_json_object_returns_client_error(self):
         for route in ('/api/create', '/api/login/send_otp', '/api/login/verify_otp'):
             self.assertEqual(self.client.post(route, json=['bad']).status_code, 400)
+
+    def test_is_mobile_only_token_detection(self):
+        import base64
+        def make_jwt(sub_dict):
+            payload = {'exp': time.time() + 3600, 'sub': json.dumps(sub_dict)}
+            encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+            return 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        mobile_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}}}})
+        self.assertTrue(live._is_mobile_only_token(mobile_tok))
+
+        super_tok = make_jwt({'subscriptions': {'in': {'HotstarSuper': {'status': 'S'}}}})
+        self.assertFalse(live._is_mobile_only_token(super_tok))
+
+        combo_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}, 'HotstarPremium': {'status': 'S'}}}})
+        self.assertFalse(live._is_mobile_only_token(combo_tok))
+
+        empty_tok = make_jwt({})
+        self.assertFalse(live._is_mobile_only_token(empty_tok))
+        self.assertFalse(live._is_mobile_only_token(None))
+
+    def test_do_bff_get_omits_accept_encoding_for_cffi(self):
+        mock_session = Mock()
+        mock_resp = Mock(status_code=200, content=b'{"ok": true}')
+        mock_session.get.return_value = mock_resp
+        with patch.object(live, '_get_cdn_session', return_value=(mock_session, 'mock_target')):
+            headers = {'accept': 'application/json', 'accept-encoding': 'gzip, deflate'}
+            resp, used_cffi = live._do_bff_get('https://example.com/api', headers, {}, 'test')
+            self.assertTrue(used_cffi)
+            self.assertEqual(resp, mock_resp)
+            passed_headers = mock_session.get.call_args.kwargs['headers']
+            self.assertNotIn('accept-encoding', passed_headers)
+            self.assertIn('accept', passed_headers)
+
+    def test_fetch_live_urls_uses_android_profile_for_mobile_token(self):
+        import base64
+        payload = {'exp': time.time() + 3600, 'sub': json.dumps({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}}}})}
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+        mobile_tok = 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        called_platforms = []
+        def mock_bff_get(url, hdrs, params, label):
+            called_platforms.append(hdrs.get('x-hs-platform'))
+            resp = Mock(status_code=200, text='{"success": {}}')
+            resp.json.return_value = {
+                'success': {
+                    'page': {
+                        'spaces': {
+                            'player': {
+                                'widget_wrappers': [{
+                                    'widget': {
+                                        'data': {
+                                            'player_config': {
+                                                'media_asset': {
+                                                    'primary': {'content_url': 'https://cdn.example/live.m3u8'}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }
+            return resp, False
+
+        with patch.object(live, 'get_proxystate', return_value=('ps_val', 'ps_ud_val')), patch.object(live, '_do_bff_get', side_effect=mock_bff_get):
+            m3u8 = live.fetch_live_urls('in/shows/foo/1271698292', mobile_tok)
+            self.assertEqual(m3u8, 'https://cdn.example/live.m3u8')
+            self.assertEqual(called_platforms[0], 'android')
+
+
+    def test_has_premium_web_subscription(self):
+        import base64
+        def make_jwt(sub_dict):
+            payload = {'exp': time.time() + 3600, 'sub': json.dumps(sub_dict)}
+            encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+            return 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        # Free / unsubscribed accounts
+        empty_tok = make_jwt({})
+        self.assertFalse(live._has_premium_web_subscription(empty_tok))
+        empty_in_tok = make_jwt({'subscriptions': {'in': {}}})
+        self.assertFalse(live._has_premium_web_subscription(empty_in_tok))
+
+        # Mobile only
+        mobile_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}}}})
+        self.assertFalse(live._has_premium_web_subscription(mobile_tok))
+
+        # Super / Premium Web
+        super_tok = make_jwt({'subscriptions': {'in': {'HotstarSuper': {'status': 'S'}}}})
+        self.assertTrue(live._has_premium_web_subscription(super_tok))
+
+        combo_tok = make_jwt({'subscriptions': {'in': {'JHSMobileLite': {'status': 'S'}, 'HotstarPremium': {'status': 'S'}}}})
+        self.assertTrue(live._has_premium_web_subscription(combo_tok))
+
+    def test_fetch_live_urls_uses_android_profile_for_free_account(self):
+        import base64
+        payload = {'exp': time.time() + 3600, 'sub': json.dumps({'subscriptions': {'in': {}}})}
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+        free_tok = 'eyJhbGciOiJIUzI1NiJ9.' + encoded + '.sig'
+
+        called_platforms = []
+        def mock_bff_get(url, hdrs, params, label):
+            called_platforms.append(hdrs.get('x-hs-platform'))
+            resp = Mock(status_code=200, text='{"success": {}}')
+            resp.json.return_value = {
+                'success': {
+                    'page': {
+                        'spaces': {
+                            'player': {
+                                'widget_wrappers': [{
+                                    'widget': {
+                                        'data': {
+                                            'player_config': {
+                                                'media_asset': {
+                                                    'primary': {'content_url': 'https://cdn.example/free_live.m3u8'}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            }
+            return resp, False
+
+        with patch.object(live, 'get_proxystate', return_value=('ps_val', 'ps_ud_val')), patch.object(live, '_do_bff_get', side_effect=mock_bff_get):
+            m3u8 = live.fetch_live_urls('in/shows/foo/1271698292', free_tok)
+            self.assertEqual(m3u8, 'https://cdn.example/free_live.m3u8')
+            self.assertEqual(called_platforms[0], 'android')
 
 
 if __name__ == '__main__':

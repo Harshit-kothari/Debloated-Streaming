@@ -244,14 +244,14 @@ async function terminalBrowser(options) {
     const loginLabel = authStatus.status === 'valid'
       ? `NOT EXPIRED${authStatus.remaining ? ' · ' + authStatus.remaining : ''}`
       : authStatus.status === 'expired' ? 'EXPIRED · press l to log in again'
-      : authStatus.status === 'none' ? 'NOT LOGGED IN · press l to log in'
+      : authStatus.status === 'none' ? 'FREE / NOT LOGGED IN · press l to log in (free)'
       : authStatus.status === 'checking' ? 'Checking...'
       : 'STATUS UNAVAILABLE · press r to retry';
     const loginColor = authStatus.status === 'valid' ? 'green' : authStatus.status === 'expired' ? 'red' : 'yellow';
     return h(Box, {flexDirection: 'column'},
       h(Text, {bold: true, color: 'cyan'}, 'Debloated Streaming'),
       h(Text, {bold: true, color: loginColor}, `Hotstar login: ${loginLabel}`),
-      h(Text, {color: 'magenta'}, 'JioHotstar: live events listed below · [r] Refresh · [j] Paste URL · [l] Log in'),
+      h(Text, {color: 'magenta'}, 'JioHotstar, SonyLiv & Fancode · No subscription required · [r] Refresh · [j] Paste URL · [l] Log in'),
       h(Box, {flexDirection: 'row'},
         h(Box, {flexDirection: 'column', width: width >= 85 ? '50%' : '100%', borderStyle: 'round', borderColor: 'cyan', paddingX: 1},
           h(Text, {bold: true}, `Live / Upcoming (${matches.length})`),
