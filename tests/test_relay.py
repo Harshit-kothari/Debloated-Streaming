@@ -46,12 +46,45 @@ class RelayTests(unittest.TestCase):
         with patch.object(live, '_get_cdn_session', return_value=(fetcher, 'mock')):
             result = self.client.get('/proxy/fixture/master.m3u8')
         self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.headers.get('Cache-Control'), 'no-cache, no-store, must-revalidate, max-age=0')
+        self.assertEqual(result.headers.get('Pragma'), 'no-cache')
         lines = result.text.splitlines()
         audio_path = lines[1].split('URI="')[1].split('"')[0]
         self.assertEqual(self.resource(audio_path), ('https://audio.example/a/hi.m3u8?sig=a%2Fb&n=2', True))
         self.assertEqual(self.resource(lines[3]), ('https://redirect.example/video/v1.m3u8?sig=video', True))
         fetcher.get.assert_called_once_with('https://cdn.example/root/master.m3u8?master=1', headers=live._m3u8_headers(), timeout=20)
         self.assertTrue(upstream.closed)
+
+    def test_master_sorts_variants_highest_quality_first(self):
+        source = '''#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",URI="https://audio.example/audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=320x180,AUDIO="audio"
+180p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,AUDIO="audio"
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,AUDIO="audio"
+360p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=96000,CODECS="mp4a.40.2"
+audio_only.m3u8
+'''
+        rewritten = live.rewrite_playlist(source, 'https://cdn.example/live/master.m3u8', 'fixture')
+        lines = rewritten.splitlines()
+        self.assertEqual(lines[0], '#EXTM3U')
+        self.assertEqual(lines[1], '#EXT-X-VERSION:3')
+        self.assertTrue(lines[2].startswith('#EXT-X-MEDIA:'))
+        # First variant must be 720p (highest bandwidth)
+        self.assertIn('RESOLUTION=1280x720', lines[3])
+        self.assertTrue(lines[4].startswith('/proxy/fixture/resource/'))
+        # Second variant must be 360p
+        self.assertIn('RESOLUTION=640x360', lines[5])
+        self.assertTrue(lines[6].startswith('/proxy/fixture/resource/'))
+        # Third variant must be 180p
+        self.assertIn('RESOLUTION=320x180', lines[7])
+        self.assertTrue(lines[8].startswith('/proxy/fixture/resource/'))
+        # Audio-only variant without resolution must be last
+        self.assertIn('BANDWIDTH=96000', lines[9])
+        self.assertTrue(lines[10].startswith('/proxy/fixture/resource/'))
 
     def test_media_playlist_rewrites_fmp4_key_and_segments(self):
         body = '''#EXTM3U

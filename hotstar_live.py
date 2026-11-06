@@ -766,6 +766,50 @@ def _resource_url(share_id, upstream_url, playlist=False):
     return f"/proxy/{share_id}/resource/{rid}"
 
 
+def _sort_variants_descending(lines):
+    """Sort EXT-X-STREAM-INF variant blocks descending by quality (resolution and bandwidth)."""
+    if not any(l.strip().startswith("#EXT-X-STREAM-INF:") for l in lines):
+        return lines
+
+    header_lines = []
+    variants = []
+    trailing_lines = []
+
+    i = 0
+    n = len(lines)
+    while i < n and not lines[i].strip().startswith("#EXT-X-STREAM-INF:"):
+        header_lines.append(lines[i])
+        i += 1
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("#EXT-X-STREAM-INF:"):
+            v_lines = [line]
+            i += 1
+            while i < n:
+                v_line = lines[i]
+                v_lines.append(v_line)
+                i += 1
+                if v_line.strip() and not v_line.strip().startswith("#"):
+                    break
+            has_res = 1 if "RESOLUTION=" in stripped else 0
+            bw_m = re.search(r"BANDWIDTH=(\d+)", stripped) or re.search(r"AVERAGE-BANDWIDTH=(\d+)", stripped)
+            bw = int(bw_m.group(1)) if bw_m else 0
+            variants.append(((has_res, bw), v_lines))
+        else:
+            trailing_lines.append(line)
+            i += 1
+
+    variants.sort(key=lambda item: item[0], reverse=True)
+
+    result = list(header_lines)
+    for _, v_lines in variants:
+        result.extend(v_lines)
+    result.extend(trailing_lines)
+    return result
+
+
 def rewrite_playlist(body, base_url, share_id):
     """Resolve against the final playlist URL, retaining every host/path/query."""
     if not body.lstrip().startswith("#EXTM3U"):
@@ -791,12 +835,15 @@ def rewrite_playlist(body, base_url, share_id):
                 return 'URI="' + _resource_url(share_id, absolute, is_playlist) + '"'
             line = re.sub(r'URI="([^"\r\n]+)"', replace_uri, line)
         lines.append(line)
+    lines = _sort_variants_descending(lines)
     return "\n".join(lines) + "\n"
 
 
 def _m3u8_headers():
     headers = _cdn_headers()
     headers["accept-encoding"] = "identity"
+    headers["cache-control"] = "no-cache"
+    headers["pragma"] = "no-cache"
     return headers
 
 
@@ -810,7 +857,14 @@ def _stream_playlist(upstream_url, share_id):
         if re.search(r'KEYFORMAT="(?!identity")[^\"]+"', response.text):
             return "This stream uses DRM. Open it in the official JioHotstar player.", 422
         body = rewrite_playlist(response.text, response.url or upstream_url, share_id)
-        return Response(body, content_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"})
+        headers = {
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+        }
+        return Response(body, content_type="application/vnd.apple.mpegurl", headers=headers)
     except Exception:
         return "Could not load the media playlist. Refresh the stream and try again.", 502
     finally:
