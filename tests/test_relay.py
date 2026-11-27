@@ -141,6 +141,49 @@ segment.m4s?sig=seg%2F1
                 self.assertEqual(self.client.get(path).status_code, 404)
             fetch.assert_not_called()
 
+    def test_sony_relay_rejects_arbitrary_hosts_and_invalid_urls(self):
+        with patch.object(live, '_get_cdn_session') as fetch:
+            for url in ('http://sonydaime.akamaized.net/live.m3u8', 'https://localhost/live.m3u8',
+                        'https://sonydaime.akamaized.net.evil.test/live.m3u8',
+                        'https://user:secret@sonydaime.akamaized.net/live.m3u8',
+                        'https://sonydaime.akamaized.net:8080/live.m3u8',
+                        'https://sonydaime.akamaized.net/live.ts', None):
+                self.assertEqual(self.client.post('/api/relay/sonyliv', json={'url': url}).status_code, 400)
+            self.assertEqual(self.client.post('/api/relay/sonyliv', json=[]).status_code, 400)
+            fetch.assert_not_called()
+
+    def test_sony_session_headers_follow_nested_playlists_and_range_segments(self):
+        created = self.client.post('/api/relay/sonyliv', json={'url': 'https://sonydaime.akamaized.net/live/master.m3u8?sig=fixture'})
+        self.assertEqual(created.status_code, 200)
+        share_id = created.json['share_id']
+        fetcher = Mock()
+        fetcher.get.side_effect = [
+            Upstream('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=123\nvideo.m3u8\n'),
+            Upstream('#EXTM3U\n#EXTINF:4,\nsegment.ts\n'),
+            Upstream(b'abc', status=206, headers={'Content-Range': 'bytes 0-2/9'}),
+        ]
+        with patch.object(live, '_get_cdn_session', return_value=(fetcher, 'mock')):
+            master = self.client.get(f'/proxy/{share_id}/master.m3u8')
+            video = self.client.get(master.text.splitlines()[-1])
+            segment = self.client.get(video.text.splitlines()[-1], headers={'Range': 'bytes=0-2'}, buffered=True)
+        self.assertEqual(segment.status_code, 206)
+        self.assertEqual(segment.data, b'abc')
+        for call in fetcher.get.call_args_list:
+            headers = call.kwargs['headers']
+            self.assertEqual(headers['origin'], 'https://www.sonyliv.com')
+            self.assertIn('Chrome', headers['user-agent'])
+            self.assertEqual(headers['accept-encoding'], 'identity')
+        self.assertEqual(fetcher.get.call_args.kwargs['headers']['Range'], 'bytes=0-2')
+        self.assertEqual(live._m3u8_headers('fixture')['origin'], 'https://www.hotstar.com')
+        self.assertEqual(self.client.post(f'/api/refresh/{share_id}').status_code, 409)
+
+    def test_sony_backup_cdn_is_allowed_without_allowing_unrelated_akamai_hosts(self):
+        allowed = self.client.post('/api/relay/sonyliv', json={'url': 'https://sonyeventsglobal.akamaized.net/live/master.m3u8?sig=fixture'})
+        self.assertEqual(allowed.status_code, 200)
+        for host in ('sonyeventsglobal.akamaized.net.evil.test', 'unrelated.akamaized.net'):
+            rejected = self.client.post('/api/relay/sonyliv', json={'url': f'https://{host}/live/master.m3u8'})
+            self.assertEqual(rejected.status_code, 400)
+
     def test_drm_uses_official_player_message(self):
         fetcher = Mock()
         upstream = Upstream('#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.widevine",URI="https://license.example/"\n')
@@ -165,13 +208,37 @@ segment.m4s?sig=seg%2F1
 
     def test_newly_saved_token_is_reloaded_and_service_port_used(self):
         live._TOKEN = 'old-token'
-        with patch.object(live, 'load_token', return_value='new-token'), patch.object(live.auth, 'authenticated_token', return_value=True), patch.object(live, 'get_device_id_from_token', return_value='device'), patch.object(live, 'fetch_live_urls', return_value='https://cdn.example/master.m3u8') as fetch:
+        with patch.object(live, 'load_token', return_value='new-token'), patch.object(live.auth, 'authenticated_token', return_value=True), patch.object(live, 'get_device_id_from_token', return_value='device'), patch.object(live, '_check_playback_playlist'), patch.object(live, 'fetch_live_urls', return_value='https://cdn.example/master.m3u8') as fetch:
             response = self.client.post('/api/create', json={'url': 'https://www.hotstar.com/in/shows/foo/1271698292/live'}, base_url='http://127.0.0.1:31415')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(live._TOKEN, 'new-token')
         self.assertEqual(fetch.call_args.args[1], 'new-token')
         self.assertTrue(response.json['m3u8_proxy'].startswith('http://127.0.0.1:31415/proxy/'))
         self.assertNotIn('new-token', json.dumps(response.json))
+
+    def test_preflight_finds_drm_in_child_before_creating_session(self):
+        master = Upstream('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=123\nvideo.m3u8\n')
+        child = Upstream('#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.widevine",URI="skd://key"\n')
+        fetcher = Mock()
+        fetcher.get.side_effect = [master, child]
+        with patch.object(live, 'load_token', return_value='signed-in'), patch.object(live.auth, 'authenticated_token', return_value=True), patch.object(live, 'fetch_live_urls', return_value=master.url), patch.object(live, '_get_cdn_session', return_value=(fetcher, 'mock')):
+            response = self.client.post('/api/create', json={'url': 'https://www.hotstar.com/in/shows/foo/1271698292/live'})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json['code'], 'drm_required')
+        self.assertIn('official JioHotstar player', response.json['error'])
+        self.assertEqual(len(live._sessions), 1)
+        self.assertTrue(master.closed and child.closed)
+
+    def test_preflight_allows_clear_video_and_audio(self):
+        master = Upstream('#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,URI="audio.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=123\nvideo.m3u8\n')
+        video = Upstream('#EXTM3U\n#EXTINF:4,\npart.ts\n')
+        audio = Upstream('#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,KEYFORMAT="identity",URI="key.bin"\n#EXTINF:4,\npart.aac\n')
+        fetcher = Mock()
+        fetcher.get.side_effect = [master, video, audio]
+        with patch.object(live, '_get_cdn_session', return_value=(fetcher, 'mock')):
+            live._check_playback_playlist(master.url)
+        self.assertEqual(fetcher.get.call_count, 3)
+        self.assertTrue(master.closed and video.closed and audio.closed)
 
     def test_guest_token_cannot_create_stream_session(self):
         import base64

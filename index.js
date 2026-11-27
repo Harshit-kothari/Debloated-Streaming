@@ -3,6 +3,7 @@ import {Backend, checkPython} from './lib/backend.js';
 import {discoverPlayers, resolvePlayer, launchPlayer} from './lib/players.js';
 import {loadCatalogue} from './lib/catalogue.js';
 import {prepareHotstarPlayback, resumeHotstarPlayback} from './lib/hotstar-flow.js';
+import {hotstarBrowser, openHotstarInBrowser} from './lib/browser.js';
 const backend = new Backend();
 const playback = new AbortController();
 const help = `Debloated Streaming
@@ -12,10 +13,11 @@ const help = `Debloated Streaming
   node index.js --login                  Log in with your phone and OTP
   node index.js --list                   Print the current event list
   node index.js --hotstar-live [--json]   Fetch live Hotstar titles and watch links
-  node index.js --hotstar URL [--player mpv|vlc] [--lang eng|hin|tel|tam]
+  node index.js --hotstar URL [--player mpv|vlc|browser] [--lang eng|hin|tel|tam]
 
 Browser: arrows navigate, Enter chooses a player, l logs in,
-j opens a Hotstar URL, r refreshes, q quits. All files live here.
+j opens a Hotstar URL, b opens the selected Hotstar event on its website,
+r refreshes, q quits. Browser playback uses your browser's own Hotstar login.
 Set MPV_PATH, VLC_PATH or PYTHON_PATH to override an executable location.`;
 function parseArgs(argv) {
   const options = {};
@@ -27,7 +29,8 @@ function parseArgs(argv) {
     } else if (['--help', '-h', '--doctor', '--login', '--list', '--hotstar-live', '--json'].includes(key)) options[key === '-h' ? 'help' : key.slice(2)] = true;
     else throw new Error(`Unknown option: ${key}. Use --help.`);
   }
-  if (options.player && !['mpv', 'vlc'].includes(options.player.toLowerCase())) throw new Error('--player must be mpv or vlc.');
+  if (options.player && !['mpv', 'vlc', 'browser'].includes(options.player.toLowerCase())) throw new Error('--player must be mpv, vlc or browser.');
+  if (options.player) options.player = options.player.toLowerCase();
   return options;
 }
 async function doctor() {
@@ -110,6 +113,7 @@ async function terminalBrowser(options) {
     const [warning, setWarning] = useState(''), [authStatus, setAuthStatus] = useState({status: 'checking'});
     const [mode, setMode] = useState('browse'), [input, setInput] = useState(''), [phone, setPhone] = useState('');
     const [candidate, setCandidate] = useState(null), [playerIndex, setPlayerIndex] = useState(defaultPlayer);
+    const playbackPlayers = candidate?.hotstarUrl ? [...players, hotstarBrowser] : players;
     const [pendingHotstar, setPendingHotstar] = useState(null);
     const [busy, setBusy] = useState(false); const locked = useRef(false);
     const feedRequest = useRef(null);
@@ -155,6 +159,11 @@ async function terminalBrowser(options) {
       setMode('browse'); setMessage(`${player.label} is playing. Close its window to return here.`);
       await play(player, url, {userAgent});
       setMessage('Player closed. Select another stream.');
+    };
+    const openOfficialHotstar = async url => {
+      await openHotstarInBrowser(url);
+      setMode('browse'); setPendingHotstar(null);
+      setMessage('Opened the Hotstar website in your browser. Sign in there if asked; its login is separate from the terminal.');
     };
     const promptLogin = async () => {
       const pending = await backend.request('/api/login/pending');
@@ -211,10 +220,12 @@ async function terminalBrowser(options) {
       }
       if (mode === 'player') {
         if (key.escape) {setMode('browse'); return;}
+        if (text.toLowerCase() === 'b' && candidate?.hotstarUrl) {run(() => openOfficialHotstar(candidate.hotstarUrl)); return;}
         if (key.upArrow) setPlayerIndex(value => Math.max(0, value - 1));
-        if (key.downArrow) setPlayerIndex(value => Math.min(players.length - 1, value + 1));
+        if (key.downArrow) setPlayerIndex(value => Math.min(playbackPlayers.length - 1, value + 1));
         if (key.return) run(async () => {
-          const player = players[playerIndex]; if (!player.available) throw new Error(player.error);
+          const player = playbackPlayers[playerIndex]; if (!player.available) throw new Error(player.error);
+          if (player.key === 'browser') {await openOfficialHotstar(candidate.hotstarUrl); return;}
           let url = candidate.streamUrl;
           if (candidate.hotstarUrl) {
             setMessage('Checking Hotstar login and preparing playback...');
@@ -225,6 +236,9 @@ async function terminalBrowser(options) {
               return;
             }
             url = ready.url;
+          } else if (candidate.provider === 'SonyLiv' && player.key === 'vlc') {
+            setMessage('Preparing SonyLiv playback through the local relay...');
+            url = (await backend.relaySony(url)).url;
           }
           await openPlayer(player, url, candidate.userAgent || '');
         });
@@ -233,6 +247,7 @@ async function terminalBrowser(options) {
       if (key.escape) {exit(); return;}
       if (text.toLowerCase() === 'l') {setPendingHotstar(null); run(promptLogin);}
       if (text.toLowerCase() === 'j') {setPendingHotstar(null); setMode('url'); setInput(''); setMessage('Paste a JioHotstar live URL. Login will be requested if needed.');}
+      if (text.toLowerCase() === 'b' && matches[index]?.hotstarUrl) {run(() => openOfficialHotstar(matches[index].hotstarUrl)); return;}
       if (text.toLowerCase() === 'r') {refreshAuthStatus(); refresh(true);}
       if (key.upArrow) setIndex(value => Math.max(0, value - 1));
       if (key.downArrow) setIndex(value => Math.min(matches.length - 1, value + 1));
@@ -268,12 +283,12 @@ async function terminalBrowser(options) {
           selected ? h(Text, {dimColor: true}, selected.streamUrl || selected.hotstarUrl ? 'Enter to play' : 'Stream not yet available') : null) : null),
       mode === 'player' ? h(Box, {flexDirection: 'column', borderStyle: 'round', paddingX: 1},
         h(Text, {bold: true}, `Play ${candidate?.title} with:`),
-        ...players.map((player, i) => h(Text, {key: player.key, inverse: i === playerIndex, color: player.available ? 'green' : 'gray'}, `${i === playerIndex ? '> ' : '  '}${player.label}${player.available ? '' : ' (not found)'}`)),
-        h(Text, {dimColor: true}, 'Arrows choose · Enter play · Esc cancel')) : null,
+        ...playbackPlayers.map((player, i) => h(Text, {key: player.key, inverse: i === playerIndex, color: player.available ? 'green' : 'gray'}, `${i === playerIndex ? '> ' : '  '}${player.label}${player.available ? '' : ' (not found)'}`)),
+        h(Text, {dimColor: true}, candidate?.hotstarUrl ? 'Arrows choose · Enter play · b Hotstar website · Esc cancel' : 'Arrows choose · Enter play · Esc cancel')) : null,
       ['phone', 'otp', 'url'].includes(mode) ? h(Box, {borderStyle: 'round', paddingX: 1}, h(Text, null, `${mode === 'phone' ? 'Phone' : mode === 'otp' ? 'OTP' : 'Hotstar URL'} > ${mode === 'otp' ? '*'.repeat(input.length) : input}█`)) : null,
       h(Text, {color: busy ? 'cyan' : 'yellow', wrap: 'wrap'}, message),
       warning ? h(Text, {color: 'yellow'}, warning) : null,
-      h(Text, {dimColor: true}, '↑/↓ navigate · Enter play · l login · j Hotstar URL · r refresh · q quit'));
+      h(Text, {dimColor: true}, '↑/↓ navigate · Enter play · b Hotstar website · l login · j Hotstar URL · r refresh · q quit'));
   }
   await render(h(App)).waitUntilExit();
 }
@@ -299,6 +314,11 @@ async function main() {
     return;
   }
   if (options.hotstar) {
+    if (options.player === 'browser') {
+      await openHotstarInBrowser(options.hotstar);
+      console.log('Opened the Hotstar website. Sign in in your browser if asked; its login is separate from the terminal.');
+      return;
+    }
     const players = await discoverPlayers();
     const player = options.player ? await resolvePlayer(options.player) : players.find(item => item.available);
     if (!player) throw new Error(players.map(item => item.error).join('\n'));

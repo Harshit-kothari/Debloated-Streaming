@@ -82,3 +82,15 @@ test('unexpected responses and warning URLs cannot leak signed playback links', 
   assert.equal(malformed.partial, true);
   assert.match(malformed.warnings[0], /unexpected catalogue response/);
 });
+
+test('Sony fallback language variants survive catalogue deduplication', async () => {
+  const fetchImpl = async url => {
+    if (url.includes('fancode')) return {ok: true, json: async () => ({matches: []})};
+    if (url.endsWith('.json')) return {ok: false, status: 503};
+    return {ok: true, text: async () => '#EXTM3U\n#EXTINF:-1 tvg-id="123", Match [ENG]\nhttps://example.test/en.m3u8\n#EXTINF:-1 tvg-id="123", Match [HIN]\nhttps://example.test/hi.m3u8\n'};
+  };
+  const result = await loadCatalogue({request: async () => ({matches: [], warnings: []})}, {fetchImpl});
+  assert.equal(result.matches.length, 2);
+  assert.deepEqual(result.matches.map(match => match.language), ['ENG', 'HIN']);
+  assert.match(result.warnings[0], /M3U backup/);
+});

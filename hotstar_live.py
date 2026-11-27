@@ -711,6 +711,12 @@ def api_create():
         return jsonify({"error": "JioHotstar did not provide a compatible HLS stream. Check the content is live and available to your account and region. DRM content requires the official player.", "code": "stream_unavailable"}), 502
     if urlparse(m3u8).scheme not in ("https", "http"):
         return jsonify({"error": "Provider returned an invalid stream URL."}), 502
+    try:
+        _check_playback_playlist(m3u8)
+    except ValueError as exc:
+        return jsonify({"error": str(exc), "code": "drm_required"}), 422
+    except Exception:
+        return jsonify({"error": "Could not check the media playlist. Refresh the stream and try again.", "code": "playlist_unavailable"}), 502
     share_id = make_share_id()
     with _sess_lock:
         _sessions[share_id] = {
@@ -730,12 +736,41 @@ def api_create():
     })
 
 
+@app.route("/api/relay/sonyliv", methods=["POST"])
+def api_relay_sonyliv():
+    """Relay the Sony CDN for players whose direct requests are rejected."""
+    data = request.get_json(silent=True)
+    url = data.get("url") if isinstance(data, dict) else None
+    try:
+        parsed = urlparse(url) if isinstance(url, str) else None
+        valid = (parsed and parsed.scheme == "https"
+                 and parsed.hostname in ("sonydaime.akamaized.net", "sonyeventsglobal.akamaized.net")
+                 and parsed.port in (None, 443) and not parsed.username and not parsed.password
+                 and parsed.path.endswith(".m3u8") and not parsed.fragment
+                 and not any(ord(char) < 32 for char in url) and "\\" not in url)
+    except ValueError:
+        valid = False
+    if not valid:
+        return jsonify(error="Expected a SonyLiv CDN playlist from the event list."), 400
+    share_id = make_share_id()
+    with _sess_lock:
+        _sessions[share_id] = {
+            "provider": "SonyLiv", "m3u8_url": url, "created_at": time.time(),
+            "resources": {}, "resource_ids": {}, "title": "SonyLiv",
+            "headers": {"user-agent": _CHROME_UA, "accept": "*/*",
+                        "origin": "https://www.sonyliv.com", "referer": "https://www.sonyliv.com/"},
+        }
+    return jsonify(share_id=share_id, m3u8_proxy=f"{request.host_url.rstrip('/')}/proxy/{share_id}/master.m3u8")
+
+
 @app.route("/api/refresh/<share_id>", methods=["POST"])
 def api_refresh(share_id):
     with _sess_lock:
         sess = _sessions.get(share_id)
     if not sess:
         return jsonify({"error": "session not found"}), 404
+    if sess.get("provider") == "SonyLiv":
+        return jsonify(error="Refresh the event list and select the SonyLiv stream again."), 409
     token = _current_token()
     if not auth.authenticated_token(token):
         return jsonify({"error": "Log in again before refreshing.", "code": "login_required"}), 401
@@ -863,22 +898,63 @@ def rewrite_playlist(body, base_url, share_id):
     return "\n".join(lines) + "\n"
 
 
-def _m3u8_headers():
-    headers = _cdn_headers()
+def _m3u8_headers(share_id=None):
+    with _sess_lock:
+        custom = _sessions.get(share_id, {}).get("headers")
+    headers = dict(custom) if custom else _cdn_headers()
     headers["accept-encoding"] = "identity"
     headers["cache-control"] = "no-cache"
     headers["pragma"] = "no-cache"
     return headers
 
 
+def _playlist_has_drm(body):
+    return bool(re.search(r'KEYFORMAT\s*=\s*"(?!identity")[^"]+"|METHOD\s*=\s*SAMPLE-AES', body, re.I))
+
+
+def _check_playback_playlist(upstream_url, depth=0):
+    """Check the master and representative video/audio before starting MPV.
+
+    Providers can declare DRM only in the child playlist. Never pass that
+    failure to MPV as a mysterious HLS I/O error.
+    """
+    session, _ = _get_cdn_session()
+    response = (session or req).get(upstream_url, headers=_m3u8_headers(), timeout=20)
+    try:
+        if response.status_code != 200 or not response.text.lstrip().startswith('#EXTM3U'):
+            raise RuntimeError('Playlist unavailable')
+        body = response.text
+        base = response.url or upstream_url
+        if _playlist_has_drm(body):
+            raise ValueError('This stream uses DRM and cannot play in MPV or VLC. Open it in the official JioHotstar player.')
+    finally:
+        response.close()
+    if depth >= 2:
+        return
+    children = []
+    variant = False
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith('#EXT-X-STREAM-INF:'):
+            variant = True
+        elif variant and line and not line.startswith('#'):
+            children.append(urljoin(base, line))
+            break
+    audio = re.search(r'^#EXT-X-MEDIA:.*TYPE=AUDIO.*URI="([^"]+)"', body, re.M)
+    if audio:
+        children.append(urljoin(base, audio.group(1)))
+    for child in dict.fromkeys(children):
+        _check_playback_playlist(child, depth + 1)
+
+
 def _stream_playlist(upstream_url, share_id):
     response = None
     try:
         session, _ = _get_cdn_session()
-        response = (session or req).get(upstream_url, headers=_m3u8_headers(), timeout=20)
+        response = (session or req).get(upstream_url, headers=_m3u8_headers(share_id), timeout=20)
         if response.status_code != 200:
             return f"Media provider returned HTTP {response.status_code}", response.status_code
-        if re.search(r'KEYFORMAT="(?!identity")[^\"]+"', response.text):
+        if _playlist_has_drm(response.text):
             return "This stream uses DRM. Open it in the official JioHotstar player.", 422
         body = rewrite_playlist(response.text, response.url or upstream_url, share_id)
         headers = {
@@ -913,23 +989,23 @@ def proxy_resource(share_id, resource_id):
     if not resource:
         return "media resource not found", 404
     upstream_url, playlist = resource
-    return _stream_playlist(upstream_url, share_id) if playlist else _stream_from(upstream_url)
+    return _stream_playlist(upstream_url, share_id) if playlist else _stream_from(upstream_url, share_id)
 
 
-def _seg_headers():
-    headers = _m3u8_headers()
+def _seg_headers(share_id=None):
+    headers = _m3u8_headers(share_id)
     for name in ("Range", "If-Range"):
         if request.headers.get(name):
             headers[name] = request.headers[name]
     return headers
 
 
-def _stream_from(upstream_url):
+def _stream_from(upstream_url, share_id=None):
     """Relay media including fMP4 init fragments and byte-range responses."""
     response = None
     try:
         session, _ = _get_cdn_session()
-        response = (session or req).get(upstream_url, headers=_seg_headers(), timeout=20, stream=True)
+        response = (session or req).get(upstream_url, headers=_seg_headers(share_id), timeout=20, stream=True)
         if response.status_code not in (200, 206):
             status = response.status_code
             response.close()

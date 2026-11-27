@@ -30,6 +30,9 @@ The original commit histories of both foundation projects are preserved alongsid
 - Supports phone/OTP login inside the terminal, pending OTP resumption, and resend cooldowns.
 - Finds MPV and VLC through common installation locations across Windows, macOS, and Linux.
 - Relays nested HLS playlists, audio tracks, init fragments, and byte ranges through a local service.
+- Fetches fresh Hotstar playback URLs when you select an event.
+- Relays SonyLiv streams locally for VLC when its direct CDN requests are rejected.
+- Opens protected Hotstar matches on the official website through the browser option or `b` shortcut.
 
 ## Cross-Platform Installation & Quick Start
 
@@ -144,6 +147,7 @@ Use only the executable path in each override. A project `.venv` is detected aut
 | Enter | Choose a player and play the selected event |
 | l | Log in to Hotstar, or resume a pending OTP |
 | j | Paste a Hotstar live URL manually |
+| b | Open the selected Hotstar event on the official website |
 | r | Refresh events and login status; resend when inside the OTP prompt |
 | Esc | Cancel a prompt or leave the browser |
 | q / Ctrl+C | Quit |
@@ -156,7 +160,7 @@ Press `l` and enter your Indian mobile number and OTP locally. A confirmed OTP r
 
 Hotstar live entries are read from Home/Sports pages, live trays, and their pagination. Press `r` after login to refresh them. Selecting an event checks your session and opens the chosen player; if login is required, the same flow resumes playback after OTP verification.
 
-The catalogue reflects what Hotstar exposes to your account and region. Page/time limits and unavailable pages are reported as partial results. DRM content requires the official Hotstar player.
+The catalogue reflects what Hotstar exposes to your account and region. Page/time limits and unavailable pages are reported as partial results. DRM is checked before launching MPV/VLC. For protected matches, choose **Hotstar website (browser · DRM)** or press `b` to open the official player. The browser uses its own Hotstar login; the terminal's OTP session does not sign your browser in. Playback still depends on your account's access and browser support.
 
 Login tokens, guest sessions, optional tunnel credentials, debug captures, dependencies, and player binaries are excluded from Git. Credentials stay in local session files and are not included in catalogue exports.
 
@@ -169,6 +173,7 @@ node index.js --list
 node index.js --hotstar-live
 node index.js --hotstar-live --json
 node index.js --hotstar 'YOUR_HOTSTAR_LIVE_URL' --player mpv --lang eng
+node index.js --hotstar 'YOUR_HOTSTAR_LIVE_URL' --player browser
 ```
 
 `--hotstar-live` prints discovered titles and official watch links. The JSON form adds metadata and partial-result warnings. Playback URLs are resolved on selection because signed media links expire.

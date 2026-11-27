@@ -109,6 +109,41 @@ test('missing executable rejects with setup instructions', async () => {
   await assert.rejects(launchPlayer({ key: 'mpv', available: false, error: 'Set MPV_PATH.' }, 'https://example.com'), /Set MPV_PATH/);
 });
 
+test('VLC media failures with exit code zero are surfaced, redacted and temporary logs removed', async () => {
+  const child = new EventEmitter();
+  let logFile;
+  const url = 'https://example.test/live.m3u8?token=private-secret';
+  const result = await launchPlayer({key: 'vlc', label: 'VLC', bin: 'test-vlc', available: true}, url, {spawn: (_bin, args) => {
+    assert.ok(args.includes('--no-one-instance'));
+    assert.equal(args.at(-1), url);
+    logFile = args.find(arg => arg.startsWith('--logfile=')).slice('--logfile='.length);
+    queueMicrotask(async () => {
+      await fs.writeFile(logFile, `access error: HTTP 403 error\nmain error: Your input can't be opened\nmain error: VLC is unable to open the MRL '${url}'.\n`);
+      child.emit('close', 0, null);
+    });
+    return child;
+  }});
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /HTTP 403/);
+  assert.ok(!result.stderr.includes('private-secret'));
+  await assert.rejects(fs.stat(path.dirname(logFile)), {code: 'ENOENT'});
+});
+
+test('VLC log tails discard partial URL lines before redaction', async () => {
+  const child = new EventEmitter();
+  const result = await launchPlayer({key: 'vlc', bin: 'test-vlc', available: true}, 'https://example.test/live.m3u8', {spawn: (_bin, args) => {
+    const logFile = args.find(arg => arg.startsWith('--logfile=')).slice('--logfile='.length);
+    queueMicrotask(async () => {
+      await fs.writeFile(logFile, `Opening https://example.test/${'private-secret'.repeat(7000)}\nmain error: Your input can't be opened\n`);
+      child.emit('close', 0, null);
+    });
+    return child;
+  }});
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /input can't be opened/);
+  assert.ok(!result.stderr.includes('private-secret'));
+});
+
 test('MPV failures written to stdout are captured and redacted for callers', async () => {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
